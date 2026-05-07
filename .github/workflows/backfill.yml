@@ -1,6 +1,6 @@
 name: RTHK Backfill Scan
 
- on:
+on:
  workflow_dispatch:
    inputs:
      start_date:
