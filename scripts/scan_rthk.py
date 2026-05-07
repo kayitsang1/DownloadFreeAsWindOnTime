@@ -6,6 +6,11 @@ from bs4 import BeautifulSoup
 
 KEYWORD = "馬鼎盛"
 
+TEST_EPISODES = [
+    "https://www.rthk.hk/radio/radio1/programme/free_as_the_wind_sunday/episode/1096310",
+    "https://www.rthk.hk/radio/radio1/programme/Free_as_the_wind/episode/1086067"
+]
+
 def fetch(url):
     return requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30).text
 
