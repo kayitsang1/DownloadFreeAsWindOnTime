@@ -4,30 +4,28 @@ import os
 import re
 import time
 from datetime import datetime
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
 
-KEYWORD = "馬鼎盛"
+KEYWORDS = ["馬鼎盛", "马鼎盛"]
 
 PROGRAMS = [
     {
         "name": "sunday",
         "url": "https://www.rthk.hk/radio/radio1/programme/free_as_the_wind_sunday",
-        "path_key": "/radio/radio1/programme/free_as_the_wind_sunday",
+        "base": "https://www.rthk.hk/radio/radio1/programme/free_as_the_wind_sunday/episode/",
     },
     {
         "name": "monday",
         "url": "https://www.rthk.hk/radio/radio1/programme/Free_as_the_wind",
-        "path_key": "/radio/radio1/programme/Free_as_the_wind",
+        "base": "https://www.rthk.hk/radio/radio1/programme/Free_as_the_wind/episode/",
     },
 ]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
 def fetch(url):
@@ -38,11 +36,6 @@ def fetch(url):
 
 def clean(text):
     return re.sub(r"\s+", " ", text or "").strip()
-
-
-def normalize_url(url):
-    url = url.split("#")[0]
-    return url
 
 
 def parse_date(text):
@@ -69,92 +62,37 @@ def parse_date(text):
     return None
 
 
-def is_episode_url(url, path_key):
-    return path_key in url and "/episode/" in url
+def extract_episode_urls_from_html(program):
+    html = fetch(program["url"])
+    urls = set()
 
+    # 1. 正常 href episode link
+    for m in re.finditer(r"/episode/(\d+)", html):
+        episode_id = m.group(1)
+        urls.add(program["base"] + episode_id)
 
-def is_program_related_url(url, path_key):
-    if "rthk.hk" not in url:
-        return False
+    # 2. JS / data attribute 裡可能出現 episode id
+    for m in re.finditer(r"(?:episode|episode_id|pid|eid)[\"'\s:=]+(\d{6,})", html, re.I):
+        episode_id = m.group(1)
+        urls.add(program["base"] + episode_id)
 
-    if path_key not in url:
-        return False
+    # 3. RTHK 頁面常把 episode id 藏在含日期附近的 HTML 區塊
+    date_blocks = re.finditer(
+        r"(\d{2}/\d{2}/\d{4})(.{0,2500}?)(\d{6,})",
+        html,
+        re.S,
+    )
 
-    if "/episode/" in url:
-        return False
+    for m in date_blocks:
+        episode_id = m.group(3)
+        urls.add(program["base"] + episode_id)
 
-    return True
+    print(f"{program['name']} raw episode URLs:", len(urls))
 
-
-def extract_links_from_page(page_url, path_key):
-    html = fetch(page_url)
-    soup = BeautifulSoup(html, "html.parser")
-
-    episode_urls = set()
-    related_urls = set()
-
-    for a in soup.find_all("a", href=True):
-        href = normalize_url(urljoin(page_url, a["href"]))
-        text = clean(a.get_text())
-
-        if is_episode_url(href, path_key):
-            episode_urls.add(href)
-
-        elif is_program_related_url(href, path_key):
-            related_urls.add(href)
-
-        if any(x in text for x in ["2025", "2026", "更多", "重溫", "10", "11", "12", "01", "02", "03"]):
-            print("DEBUG LINK:", text, "=>", href)
-
-    return episode_urls, related_urls
-
-
-def collect_episode_urls(program):
-    start_url = program["url"]
-    path_key = program["path_key"]
-
-    pages_to_visit = [start_url]
-    visited_pages = set()
-    all_episode_urls = set()
-
-    print("==== COLLECTING:", program["name"], "====")
-
-    while pages_to_visit:
-        page_url = pages_to_visit.pop(0)
-        page_url = normalize_url(page_url)
-
-        if page_url in visited_pages:
-            continue
-
-        visited_pages.add(page_url)
-
-        print("VISIT PAGE:", page_url)
-
-        try:
-            episode_urls, related_urls = extract_links_from_page(page_url, path_key)
-        except Exception as e:
-            print("PAGE ERROR:", page_url, e)
-            continue
-
-        for u in episode_urls:
-            all_episode_urls.add(u)
-
-        for u in related_urls:
-            if u not in visited_pages and u not in pages_to_visit:
-                pages_to_visit.append(u)
-
-        time.sleep(1)
-
-        if len(visited_pages) > 40:
-            print("STOP: too many pages visited")
-            break
-
-    print(program["name"], "episode URLs:", len(all_episode_urls))
-
-    for u in sorted(all_episode_urls):
+    for u in sorted(urls):
         print("EPISODE:", u)
 
-    return sorted(all_episode_urls)
+    return sorted(urls)
 
 
 def extract_hosts(text):
@@ -171,11 +109,20 @@ def extract_hosts(text):
     return ""
 
 
-def extract_title(soup):
+def extract_title(soup, text):
+    lines = [clean(line) for line in text.splitlines() if clean(line)]
+
     for tag in soup.find_all(["h1", "h2", "h3"]):
         t = clean(tag.get_text())
-        if t and "講東講西" not in t and t != "電視":
+        if t and t not in ["電視", "电视", "講東講西", "講東講西 (星期一至五)"]:
             return t
+
+    # 後備：找日期後面的第一個像題目的行
+    for i, line in enumerate(lines):
+        if re.match(r"\d{2}/\d{2}/\d{4}", line):
+            for candidate in lines[i + 1:i + 6]:
+                if candidate and not any(x in candidate for x in ["主持", "足本", "第一部份", "第二部份"]):
+                    return candidate
 
     return ""
 
@@ -183,14 +130,13 @@ def extract_title(soup):
 def extract_detail(url, programme_name):
     html = fetch(url)
     soup = BeautifulSoup(html, "html.parser")
-
     text = soup.get_text("\n")
     flat = clean(text)
 
     date = parse_date(flat)
-    title = extract_title(soup)
+    title = extract_title(soup, text)
     hosts = extract_hosts(text)
-    matched = KEYWORD in hosts
+    matched = any(k in hosts for k in KEYWORDS)
 
     print("----")
     print("URL:", url)
@@ -211,15 +157,7 @@ def extract_detail(url, programme_name):
 
 
 def write_csv(path, rows):
-    fields = [
-        "date",
-        "programme",
-        "title",
-        "hosts",
-        "matched",
-        "episode_url",
-        "error",
-    ]
+    fields = ["date", "programme", "title", "hosts", "matched", "episode_url", "error"]
 
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -233,7 +171,7 @@ def main():
     parser.add_argument("--end", required=True)
     args = parser.parse_args()
 
-    print("RUNNING HISTORICAL CRAWLER VERSION")
+    print("RUNNING EPISODE-ID PARSER VERSION")
 
     start = datetime.fromisoformat(args.start).date()
     end = datetime.fromisoformat(args.end).date()
@@ -245,7 +183,7 @@ def main():
     error_rows = []
 
     for program in PROGRAMS:
-        episode_urls = collect_episode_urls(program)
+        episode_urls = extract_episode_urls_from_html(program)
 
         for url in episode_urls:
             try:
@@ -260,7 +198,6 @@ def main():
                     "episode_url": url,
                     "error": str(e),
                 }
-
                 error_rows.append(row)
                 all_rows.append(row)
                 print("DETAIL ERROR:", url, e)
@@ -275,7 +212,6 @@ def main():
 
             if start <= d <= end:
                 all_rows.append(row)
-
                 if row["matched"]:
                     matched_rows.append(row)
 
