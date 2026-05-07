@@ -1,26 +1,33 @@
+import csv
+import os
+import re
 import requests
 from bs4 import BeautifulSoup
 
-TEST_URL = "https://www.rthk.hk/radio/radio1/programme/free_as_the_wind_sunday/episode/1096310"
+KEYWORD = "馬鼎盛"
 
-print("RUNNING SMOKE TEST V3")
+def fetch(url):
+    return requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30).text
 
-headers = {
-    "User-Agent": "Mozilla/5.0"
-}
+def extract(url):
+    html = fetch(url)
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n")
 
-r = requests.get(TEST_URL, headers=headers, timeout=30)
+    match = re.search(r"(主持人?|主持)\s*[:：]\s*(.*)", text)
+    hosts = match.group(2).strip() if match else ""
 
-print("status:", r.status_code)
-print("length:", len(r.text))
-print("contains 馬鼎盛:", "馬鼎盛" in r.text)
+    return {
+        "url": url,
+        "hosts": hosts,
+        "matched": KEYWORD in hosts
+    }
 
-soup = BeautifulSoup(r.text, "html.parser")
-text = soup.get_text("\n")
+os.makedirs("output", exist_ok=True)
 
-print("text contains 馬鼎盛:", "馬鼎盛" in text)
+rows = []
 
-for line in text.splitlines():
-    line = line.strip()
-    if "主持" in line or "馬鼎盛" in line:
-        print("MATCH LINE:", line)
+for url in TEST_EPISODES:
+    row = extract(url)
+    print(row)
+    rows.appe
