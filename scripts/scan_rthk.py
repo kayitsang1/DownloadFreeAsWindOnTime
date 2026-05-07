@@ -4,7 +4,6 @@ import os
 import re
 import time
 from datetime import datetime
-from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -66,24 +65,18 @@ def extract_episode_urls_from_html(program):
     html = fetch(program["url"])
     urls = set()
 
-    # 1. 正常 href episode link
+    # 正常 href episode link
     for m in re.finditer(r"/episode/(\d+)", html):
         episode_id = m.group(1)
         urls.add(program["base"] + episode_id)
 
-    # 2. JS / data attribute 裡可能出現 episode id
+    # JS / data attribute 裡可能出現 episode id
     for m in re.finditer(r"(?:episode|episode_id|pid|eid)[\"'\s:=]+(\d{6,})", html, re.I):
         episode_id = m.group(1)
         urls.add(program["base"] + episode_id)
 
-    # 3. RTHK 頁面常把 episode id 藏在含日期附近的 HTML 區塊
-    date_blocks = re.finditer(
-        r"(\d{2}/\d{2}/\d{4})(.{0,2500}?)(\d{6,})",
-        html,
-        re.S,
-    )
-
-    for m in date_blocks:
+    # 日期附近可能藏 episode id
+    for m in re.finditer(r"(\d{2}/\d{2}/\d{4})(.{0,2500}?)(\d{6,})", html, re.S):
         episode_id = m.group(3)
         urls.add(program["base"] + episode_id)
 
@@ -95,47 +88,104 @@ def extract_episode_urls_from_html(program):
     return sorted(urls)
 
 
-def extract_hosts(text):
-    lines = [clean(line) for line in text.splitlines() if clean(line)]
+def is_noise_line(line):
+    noise = {
+        "講東講西",
+        "講東講西 - 週日版",
+        "講東講西 (星期一至五)",
+        "所有集數",
+        "電視",
+        "电视",
+        "電台",
+        "最新",
+        "重溫",
+        "CATCHUP",
+        "LATEST",
+        "GIST",
+        "足本 Full",
+        "第一部份 Part 1",
+        "第二部份 Part 2",
+    }
 
+    if line in noise:
+        return True
+
+    if re.match(r"^\d{2}/\d{2}/\d{4}", line):
+        return True
+
+    if "主持" in line:
+        return True
+
+    return False
+
+
+def extract_hosts_and_index(lines):
+    host_index = -1
+    hosts = ""
+
+    # 取最後一個主持行，避免抓到頁面前面的最新 / 重溫列表
     for i, line in enumerate(lines):
         if "主持" in line and ("：" in line or ":" in line):
             value = re.sub(r"^.*?主持人?\s*[:：]\s*", "", line)
-            return clean(value)
+            value = clean(value)
 
-        if line in ["主持", "主持人"] and i + 1 < len(lines):
-            return clean(lines[i + 1])
+            if value:
+                host_index = i
+                hosts = value
+
+    return hosts, host_index
+
+
+def extract_title_near_host(lines, host_index):
+    if host_index == -1:
+        return ""
+
+    # 標題通常在主持人上一兩行
+    for j in range(host_index - 1, -1, -1):
+        candidate = clean(lines[j])
+
+        if not candidate:
+            continue
+
+        if is_noise_line(candidate):
+            continue
+
+        return candidate
 
     return ""
 
 
-def extract_title(soup, text):
-    lines = [clean(line) for line in text.splitlines() if clean(line)]
+def extract_date_near_host(lines, host_index):
+    if host_index == -1:
+        return None
 
-    for tag in soup.find_all(["h1", "h2", "h3"]):
-        t = clean(tag.get_text())
-        if t and t not in ["電視", "电视", "講東講西", "講東講西 (星期一至五)"]:
-            return t
+    # 日期通常在主持人後面二十行內
+    after_host = " ".join(lines[host_index:host_index + 25])
+    date = parse_date(after_host)
 
-    # 後備：找日期後面的第一個像題目的行
-    for i, line in enumerate(lines):
-        if re.match(r"\d{2}/\d{2}/\d{4}", line):
-            for candidate in lines[i + 1:i + 6]:
-                if candidate and not any(x in candidate for x in ["主持", "足本", "第一部份", "第二部份"]):
-                    return candidate
+    if date:
+        return date
 
-    return ""
+    # 有些頁面日期在主持人之前
+    before_host = " ".join(lines[max(0, host_index - 10):host_index + 1])
+    return parse_date(before_host)
 
 
 def extract_detail(url, programme_name):
     html = fetch(url)
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n")
-    flat = clean(text)
 
-    date = parse_date(flat)
-    title = extract_title(soup, text)
-    hosts = extract_hosts(text)
+    text = soup.get_text("\n")
+    lines = [clean(line) for line in text.splitlines() if clean(line)]
+
+    hosts, host_index = extract_hosts_and_index(lines)
+    title = extract_title_near_host(lines, host_index)
+    date = extract_date_near_host(lines, host_index)
+
+    # 後備：如果附近找不到日期，才掃全文
+    if not date:
+        date = parse_date(clean(text))
+
     matched = any(k in hosts for k in KEYWORDS)
 
     print("----")
@@ -171,7 +221,7 @@ def main():
     parser.add_argument("--end", required=True)
     args = parser.parse_args()
 
-    print("RUNNING EPISODE-ID PARSER VERSION")
+    print("RUNNING DETAIL-PARSER FIX VERSION")
 
     start = datetime.fromisoformat(args.start).date()
     end = datetime.fromisoformat(args.end).date()
@@ -212,6 +262,7 @@ def main():
 
             if start <= d <= end:
                 all_rows.append(row)
+
                 if row["matched"]:
                     matched_rows.append(row)
 
