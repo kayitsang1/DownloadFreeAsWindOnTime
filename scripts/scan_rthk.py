@@ -24,7 +24,9 @@ PROGRAMS = [
     },
 ]
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
 
 
 def fetch(url):
@@ -61,26 +63,60 @@ def parse_date(text):
     return None
 
 
-def extract_episode_urls_from_html(program):
-    html = fetch(program["url"])
+def extract_episode_urls_from_html(program, max_pages=30):
+    """
+    RTHK 節目頁每頁大約 10 集。
+    data-nextpage="2" 對應下一批資料。
+    這裡用 ?start=0,10,20... 嘗試抓歷史頁。
+    max_pages=30 即最多抓約 300 集，足夠半年回溯。
+    """
     urls = set()
 
-    # 正常 href episode link
-    for m in re.finditer(r"/episode/(\d+)", html):
-        episode_id = m.group(1)
-        urls.add(program["base"] + episode_id)
+    for offset in range(0, max_pages * 10, 10):
+        page_url = f"{program['url']}?start={offset}"
+        print("FETCH PAGE:", page_url)
 
-    # JS / data attribute 裡可能出現 episode id
-    for m in re.finditer(r"(?:episode|episode_id|pid|eid)[\"'\s:=]+(\d{6,})", html, re.I):
-        episode_id = m.group(1)
-        urls.add(program["base"] + episode_id)
+        try:
+            html = fetch(page_url)
+        except Exception as e:
+            print("PAGE FETCH ERROR:", page_url, e)
+            continue
 
-    # 日期附近可能藏 episode id
-    for m in re.finditer(r"(\d{2}/\d{2}/\d{4})(.{0,2500}?)(\d{6,})", html, re.S):
-        episode_id = m.group(3)
-        urls.add(program["base"] + episode_id)
+        found_this_page = set()
 
-    print(f"{program['name']} raw episode URLs:", len(urls))
+        # 1. 抓 data-episode="1096938"
+        for m in re.finditer(r'data-episode=["\'](\d+)["\']', html):
+            episode_id = m.group(1)
+            found_this_page.add(program["base"] + episode_id)
+
+        # 2. 後備：抓 /episode/1096938
+        for m in re.finditer(r"/episode/(\d+)", html):
+            episode_id = m.group(1)
+            found_this_page.add(program["base"] + episode_id)
+
+        # 3. 後備：抓 episode_id / eid / pid 類似欄位
+        for m in re.finditer(r"(?:episode|episode_id|pid|eid)[\"'\s:=]+(\d{6,})", html, re.I):
+            episode_id = m.group(1)
+            found_this_page.add(program["base"] + episode_id)
+
+        print(f"FOUND ON PAGE offset={offset}:", len(found_this_page))
+
+        before = len(urls)
+        urls.update(found_this_page)
+        after = len(urls)
+
+        # 如果連續抓到的都是重複或空頁，可能已到盡頭
+        if offset > 0 and len(found_this_page) == 0:
+            print("STOP: no episode found on this page")
+            break
+
+        if offset > 0 and after == before:
+            print("STOP: no new episode found on this page")
+            break
+
+        time.sleep(0.5)
+
+    print(f"{program['name']} total episode URLs:", len(urls))
 
     for u in sorted(urls):
         print("EPISODE:", u)
@@ -123,7 +159,7 @@ def extract_hosts_and_index(lines):
     host_index = -1
     hosts = ""
 
-    # 取最後一個主持行，避免抓到頁面前面的最新 / 重溫列表
+    # 取最後一個主持行，避免抓到頁面前方的最新 / 重溫資料
     for i, line in enumerate(lines):
         if "主持" in line and ("：" in line or ":" in line):
             value = re.sub(r"^.*?主持人?\s*[:：]\s*", "", line)
@@ -159,7 +195,7 @@ def extract_date_near_host(lines, host_index):
     if host_index == -1:
         return None
 
-    # 日期通常在主持人後面二十行內
+    # 日期通常在主持人後面二十多行內
     after_host = " ".join(lines[host_index:host_index + 25])
     date = parse_date(after_host)
 
@@ -168,7 +204,12 @@ def extract_date_near_host(lines, host_index):
 
     # 有些頁面日期在主持人之前
     before_host = " ".join(lines[max(0, host_index - 10):host_index + 1])
-    return parse_date(before_host)
+    date = parse_date(before_host)
+
+    if date:
+        return date
+
+    return None
 
 
 def extract_detail(url, programme_name):
@@ -207,7 +248,15 @@ def extract_detail(url, programme_name):
 
 
 def write_csv(path, rows):
-    fields = ["date", "programme", "title", "hosts", "matched", "episode_url", "error"]
+    fields = [
+        "date",
+        "programme",
+        "title",
+        "hosts",
+        "matched",
+        "episode_url",
+        "error",
+    ]
 
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -219,9 +268,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
+    parser.add_argument("--max-pages", type=int, default=30)
     args = parser.parse_args()
 
-    print("RUNNING DETAIL-PARSER FIX VERSION")
+    print("RUNNING PAGINATION VERSION")
 
     start = datetime.fromisoformat(args.start).date()
     end = datetime.fromisoformat(args.end).date()
@@ -232,10 +282,20 @@ def main():
     matched_rows = []
     error_rows = []
 
+    seen_urls = set()
+
     for program in PROGRAMS:
-        episode_urls = extract_episode_urls_from_html(program)
+        episode_urls = extract_episode_urls_from_html(
+            program,
+            max_pages=args.max_pages,
+        )
 
         for url in episode_urls:
+            if url in seen_urls:
+                continue
+
+            seen_urls.add(url)
+
             try:
                 row = extract_detail(url, program["name"])
             except Exception as e:
@@ -266,7 +326,11 @@ def main():
                 if row["matched"]:
                     matched_rows.append(row)
 
-            time.sleep(1)
+            time.sleep(0.5)
+
+    all_rows.sort(key=lambda r: (r["date"], r["programme"], r["title"]))
+    matched_rows.sort(key=lambda r: (r["date"], r["programme"], r["title"]))
+    error_rows.sort(key=lambda r: r["episode_url"])
 
     write_csv("output/all_episodes.csv", all_rows)
     write_csv("output/matched_episodes.csv", matched_rows)
