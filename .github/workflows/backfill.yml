@@ -1,0 +1,36 @@
+name: RTHK Backfill Scan
+
+ on:
+ workflow_dispatch:
+   inputs:
+     start_date:
+       description: "Start date"
+       required: true
+       default: "2025-10-01"
+     end_date:
+       description: "End date"
+       required: true
+       default: "2026-03-31"
+
+ jobs:
+ scan:
+   runs-on: ubuntu-latest
+
+   steps:
+     - uses: actions/checkout@v4
+
+     - uses: actions/setup-python@v5
+       with:
+         python-version: "3.11"
+
+     - run: pip install -r requirements.txt
+
+     - run: |
+         python scripts/scan_rthk.py \
+           --start "${{ github.event.inputs.start_date }}" \
+           --end "${{ github.event.inputs.end_date }}"
+
+     - uses: actions/upload-artifact@v4
+       with:
+         name: rthk-scan-results
+         path: output/*.csv
