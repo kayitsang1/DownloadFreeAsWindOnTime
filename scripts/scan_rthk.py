@@ -1,5 +1,7 @@
 import argparse
 import csv
+import html as html_lib
+import json
 import os
 import re
 import time
@@ -30,7 +32,7 @@ CATCHUP_BASE = "https://www.rthk.hk/radio/catchUp"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept": "application/json, text/javascript, /; q=0.01",
     "X-Requested-With": "XMLHttpRequest",
 }
 
@@ -73,24 +75,64 @@ def parse_date(text):
     return None
 
 
-def extract_episode_ids_from_html(html):
+def extract_episode_ids_from_html(raw):
     episode_ids = set()
 
-    # Main source: data-episode="1096938"
-    for m in re.finditer(r'data-episode=["\'](\d+)["\']', html):
-        episode_ids.add(m.group(1))
+    candidates = [raw]
 
-    # Fallback: /episode/1096938
-    for m in re.finditer(r"/episode/(\d+)", html):
-        episode_ids.add(m.group(1))
+    # catchUp API 可能回傳 JSON，裡面再包 HTML。
+    try:
+        data = json.loads(raw)
 
-    # Fallback: episode_id / eid / pid-like fields
-    for m in re.finditer(
-        r"(?:episode|episode_id|pid|eid)[\"'\s:=]+(\d{6,})",
-        html,
-        re.I,
-    ):
-        episode_ids.add(m.group(1))
+        def walk(obj):
+            if isinstance(obj, dict):
+                for v in obj.values():
+                    walk(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    walk(v)
+            elif isinstance(obj, str):
+                candidates.append(obj)
+
+        walk(data)
+
+    except Exception:
+        pass
+
+    expanded = []
+    for c in candidates:
+        if not isinstance(c, str):
+            continue
+
+        expanded.append(c)
+        expanded.append(html_lib.unescape(c))
+
+        # 有些 response 會把引號 escape 成 \"
+        try:
+            expanded.append(c.encode("utf-8").decode("unicode_escape"))
+        except Exception:
+            pass
+
+    for text in expanded:
+        # data-episode="1096938"
+        for m in re.finditer(r'data-episode=["\'](\d+)["\']', text):
+            episode_ids.add(m.group(1))
+
+        # data-episode=\"1096938\"
+        for m in re.finditer(r'data-episode=\\?["\'](\d+)\\?["\']', text):
+            episode_ids.add(m.group(1))
+
+        # /episode/1096938
+        for m in re.finditer(r"/episode/(\d+)", text):
+            episode_ids.add(m.group(1))
+
+        # episode_id / eid / pid 類似欄位
+        for m in re.finditer(
+            r"(?:episode|episode_id|pid|eid)[\"'\s:=]+(\d{6,})",
+            text,
+            re.I,
+        ):
+            episode_ids.add(m.group(1))
 
     return episode_ids
 
@@ -100,7 +142,6 @@ def collect_episode_urls(program, max_pages):
 
     print("==== COLLECTING:", program["name"], "====")
 
-    # Page 1: programme home page
     print("FETCH HOME:", program["home_url"])
     try:
         html = fetch(program["home_url"], referer=program["home_url"])
@@ -115,7 +156,6 @@ def collect_episode_urls(program, max_pages):
 
     empty_or_duplicate_count = 0
 
-    # Page 2 onward: real catchUp API
     for page in range(2, max_pages + 1):
         api_url = (
             f"{CATCHUP_BASE}"
@@ -129,6 +169,7 @@ def collect_episode_urls(program, max_pages):
 
         try:
             html = fetch(api_url, referer=program["home_url"])
+            print("CATCHUP RESPONSE HEAD:", html[:300].replace("\n", " "))
         except Exception as e:
             print("CATCHUP FETCH ERROR:", api_url, e)
             empty_or_duplicate_count += 1
@@ -204,10 +245,9 @@ def extract_hosts_and_index(lines):
     host_index = -1
     hosts = ""
 
-    # Use the last host line to avoid grabbing latest/catchup sidebar content.
     for i, line in enumerate(lines):
         if "主持" in line and ("：" in line or ":" in line):
-            value = re.sub(r"^.*?主持人?\s*[:：]\s*", "", line)
+            value = re.sub(r"^.?主持人?\s[:：]\s*", "", line)
             value = clean(value)
 
             if value:
@@ -312,7 +352,7 @@ def main():
     parser.add_argument("--max-pages", type=int, default=40)
     args = parser.parse_args()
 
-    print("RUNNING REAL CATCHUP ENDPOINT VERSION")
+    print("RUNNING JSON CATCHUP PARSER VERSION")
 
     start = datetime.fromisoformat(args.start).date()
     end = datetime.fromisoformat(args.end).date()
