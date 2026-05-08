@@ -42,9 +42,9 @@ def fetch(url, referer=None):
     if referer:
         headers["Referer"] = referer
 
-    r = requests.get(url, headers=headers, timeout=30)
-    r.raise_for_status()
-    return r.text
+    response = requests.get(url, headers=headers, timeout=30)
+    response.raise_for_status()
+    return response.text
 
 
 def clean(text):
@@ -58,19 +58,19 @@ def parse_date(text):
         r"(\d{4})/(\d{1,2})/(\d{1,2})",
     ]
 
-    for p in patterns:
-        m = re.search(p, text)
-        if not m:
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
             continue
 
-        parts = m.groups()
+        parts = match.groups()
 
         if len(parts[0]) == 4:
-            y, mo, d = map(int, parts)
+            year, month, day = map(int, parts)
         else:
-            d, mo, y = map(int, parts)
+            day, month, year = map(int, parts)
 
-        return datetime(y, mo, d).date()
+        return datetime(year, month, day).date()
 
     return None
 
@@ -78,61 +78,58 @@ def parse_date(text):
 def extract_episode_ids_from_html(raw):
     episode_ids = set()
 
-    candidates = [raw]
-
-    # catchUp API 可能回傳 JSON，裡面再包 HTML。
+    # 1. catchUp API: JSON format, usually {"status":"1","content":[{"id":"1081669", ...}]}
     try:
         data = json.loads(raw)
 
+        if isinstance(data, dict) and "content" in data:
+            for item in data.get("content", []):
+                if isinstance(item, dict):
+                    episode_id = item.get("id")
+                    if episode_id and str(episode_id).isdigit():
+                        episode_ids.add(str(episode_id))
+
+        # Fallback recursive search for any numeric id-like fields
         def walk(obj):
             if isinstance(obj, dict):
-                for v in obj.values():
-                    walk(v)
+                for key, value in obj.items():
+                    if key in {"id", "episode", "episode_id", "eid", "pid"}:
+                        if str(value).isdigit() and len(str(value)) >= 6:
+                            episode_ids.add(str(value))
+                    else:
+                        walk(value)
             elif isinstance(obj, list):
-                for v in obj:
-                    walk(v)
-            elif isinstance(obj, str):
-                candidates.append(obj)
+                for value in obj:
+                    walk(value)
 
         walk(data)
 
     except Exception:
         pass
 
-    expanded = []
-    for c in candidates:
-        if not isinstance(c, str):
-            continue
+    # 2. HTML / escaped HTML fallback
+    candidates = [raw, html_lib.unescape(raw)]
 
-        expanded.append(c)
-        expanded.append(html_lib.unescape(c))
-
-        # 有些 response 會把引號 escape 成 \"
-        try:
-            expanded.append(c.encode("utf-8").decode("unicode_escape"))
-        except Exception:
-            pass
-
-    for text in expanded:
+    for text in candidates:
         # data-episode="1096938"
-        for m in re.finditer(r'data-episode=["\'](\d+)["\']', text):
-            episode_ids.add(m.group(1))
+        for match in re.finditer(r'data-episode=["\'](\d+)["\']', text):
+            episode_ids.add(match.group(1))
 
         # data-episode=\"1096938\"
-        for m in re.finditer(r'data-episode=\\?["\'](\d+)\\?["\']', text):
-            episode_ids.add(m.group(1))
+        for match in re.finditer(r'data-episode=\\?["\'](\d+)\\?["\']', text):
+            episode_ids.add(match.group(1))
 
         # /episode/1096938
-        for m in re.finditer(r"/episode/(\d+)", text):
-            episode_ids.add(m.group(1))
+        for match in re.finditer(r"/episode/(\d+)", text):
+            episode_ids.add(match.group(1))
 
-        # episode_id / eid / pid 類似欄位
-        for m in re.finditer(
-            r"(?:episode|episode_id|pid|eid)[\"'\s:=]+(\d{6,})",
+        # episode_id / eid / pid / id style fields
+        for match in re.finditer(
+            r"(?:episode|episode_id|pid|eid|id)[\"'\s:=]+(\d{6,})",
             text,
             re.I,
         ):
-            episode_ids.add(m.group(1))
+            episode_ids.add(match.group(1))
 
     return episode_ids
 
@@ -142,7 +139,9 @@ def collect_episode_urls(program, max_pages):
 
     print("==== COLLECTING:", program["name"], "====")
 
+    # Page 1: programme home page
     print("FETCH HOME:", program["home_url"])
+
     try:
         html = fetch(program["home_url"], referer=program["home_url"])
         ids = extract_episode_ids_from_html(html)
@@ -151,11 +150,12 @@ def collect_episode_urls(program, max_pages):
         for episode_id in ids:
             urls.add(program["episode_base"] + episode_id)
 
-    except Exception as e:
-        print("HOME FETCH ERROR:", e)
+    except Exception as error:
+        print("HOME FETCH ERROR:", error)
 
     empty_or_duplicate_count = 0
 
+    # Page 2 onward: real catchUp API
     for page in range(2, max_pages + 1):
         api_url = (
             f"{CATCHUP_BASE}"
@@ -168,10 +168,10 @@ def collect_episode_urls(program, max_pages):
         print("FETCH CATCHUP:", api_url)
 
         try:
-            html = fetch(api_url, referer=program["home_url"])
-            print("CATCHUP RESPONSE HEAD:", html[:300].replace("\n", " "))
-        except Exception as e:
-            print("CATCHUP FETCH ERROR:", api_url, e)
+            raw = fetch(api_url, referer=program["home_url"])
+            print("CATCHUP RESPONSE HEAD:", raw[:300].replace("\n", " "))
+        except Exception as error:
+            print("CATCHUP FETCH ERROR:", api_url, error)
             empty_or_duplicate_count += 1
 
             if empty_or_duplicate_count >= 2:
@@ -179,7 +179,7 @@ def collect_episode_urls(program, max_pages):
 
             continue
 
-        ids = extract_episode_ids_from_html(html)
+        ids = extract_episode_ids_from_html(raw)
         print(f"FOUND PAGE {page}:", len(ids))
 
         before = len(urls)
@@ -204,8 +204,8 @@ def collect_episode_urls(program, max_pages):
 
     print(program["name"], "total episode URLs:", len(urls))
 
-    for u in sorted(urls):
-        print("EPISODE:", u)
+    for url in sorted(urls):
+        print("EPISODE:", url)
 
     return sorted(urls)
 
@@ -245,13 +245,14 @@ def extract_hosts_and_index(lines):
     host_index = -1
     hosts = ""
 
-    for i, line in enumerate(lines):
+    # Use the last host line to avoid latest/catchup sidebar content.
+    for index, line in enumerate(lines):
         if "主持" in line and ("：" in line or ":" in line):
             value = re.sub(r"^.?主持人?\s[:：]\s*", "", line)
             value = clean(value)
 
             if value:
-                host_index = i
+                host_index = index
                 hosts = value
 
     return hosts, host_index
@@ -261,8 +262,8 @@ def extract_title_near_host(lines, host_index):
     if host_index == -1:
         return ""
 
-    for j in range(host_index - 1, -1, -1):
-        candidate = clean(lines[j])
+    for index in range(host_index - 1, -1, -1):
+        candidate = clean(lines[index])
 
         if not candidate:
             continue
@@ -308,7 +309,7 @@ def extract_detail(url, programme_name):
     if not date:
         date = parse_date(clean(text))
 
-    matched = any(k in hosts for k in KEYWORDS)
+    matched = any(keyword in hosts for keyword in KEYWORDS)
 
     print("----")
     print("URL:", url)
@@ -339,8 +340,8 @@ def write_csv(path, rows):
         "error",
     ]
 
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+    with open(path, "w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -352,7 +353,7 @@ def main():
     parser.add_argument("--max-pages", type=int, default=40)
     args = parser.parse_args()
 
-    print("RUNNING JSON CATCHUP PARSER VERSION")
+    print("RUNNING JSON ID CATCHUP PARSER VERSION")
 
     start = datetime.fromisoformat(args.start).date()
     end = datetime.fromisoformat(args.end).date()
@@ -379,7 +380,7 @@ def main():
 
             try:
                 row = extract_detail(url, program["name"])
-            except Exception as e:
+            except Exception as error:
                 row = {
                     "date": "",
                     "programme": program["name"],
@@ -387,11 +388,11 @@ def main():
                     "hosts": "",
                     "matched": False,
                     "episode_url": url,
-                    "error": str(e),
+                    "error": str(error),
                 }
                 error_rows.append(row)
                 all_rows.append(row)
-                print("DETAIL ERROR:", url, e)
+                print("DETAIL ERROR:", url, error)
                 continue
 
             if not row["date"]:
@@ -399,9 +400,9 @@ def main():
                 all_rows.append(row)
                 continue
 
-            d = datetime.fromisoformat(row["date"]).date()
+            episode_date = datetime.fromisoformat(row["date"]).date()
 
-            if start <= d <= end:
+            if start <= episode_date <= end:
                 all_rows.append(row)
 
                 if row["matched"]:
@@ -409,9 +410,9 @@ def main():
 
             time.sleep(0.5)
 
-    all_rows.sort(key=lambda r: (r["date"], r["programme"], r["title"]))
-    matched_rows.sort(key=lambda r: (r["date"], r["programme"], r["title"]))
-    error_rows.sort(key=lambda r: r["episode_url"])
+    all_rows.sort(key=lambda row: (row["date"], row["programme"], row["title"]))
+    matched_rows.sort(key=lambda row: (row["date"], row["programme"], row["title"]))
+    error_rows.sort(key=lambda row: row["episode_url"])
 
     write_csv("output/all_episodes.csv", all_rows)
     write_csv("output/matched_episodes.csv", matched_rows)
