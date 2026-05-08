@@ -4,7 +4,6 @@ import os
 import re
 import time
 from datetime import datetime
-from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -27,16 +26,21 @@ PROGRAMS = [
     },
 ]
 
-CATCHUP_BASE = "https://www.rthk.hk/radio/radio1/programme/catchUp"
+CATCHUP_BASE = "https://www.rthk.hk/radio/catchUp"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
-    "Referer": "https://www.rthk.hk/",
+    "Accept": "application/json, text/javascript, /; q=0.01",
+    "X-Requested-With": "XMLHttpRequest",
 }
 
 
-def fetch(url):
-    r = requests.get(url, headers=HEADERS, timeout=30)
+def fetch(url, referer=None):
+    headers = dict(HEADERS)
+    if referer:
+        headers["Referer"] = referer
+
+    r = requests.get(url, headers=headers, timeout=30)
     r.raise_for_status()
     return r.text
 
@@ -72,16 +76,20 @@ def parse_date(text):
 def extract_episode_ids_from_html(html):
     episode_ids = set()
 
-    # 主要來源：data-episode="1096938"
+    # Main source: data-episode="1096938"
     for m in re.finditer(r'data-episode=["\'](\d+)["\']', html):
         episode_ids.add(m.group(1))
 
-    # 後備：/episode/1096938
+    # Fallback: /episode/1096938
     for m in re.finditer(r"/episode/(\d+)", html):
         episode_ids.add(m.group(1))
 
-    # 後備：episode_id / eid / pid 之類
-    for m in re.finditer(r"(?:episode|episode_id|pid|eid)[\"'\s:=]+(\d{6,})", html, re.I):
+    # Fallback: episode_id / eid / pid-like fields
+    for m in re.finditer(
+        r"(?:episode|episode_id|pid|eid)[\"'\s:=]+(\d{6,})",
+        html,
+        re.I,
+    ):
         episode_ids.add(m.group(1))
 
     return episode_ids
@@ -92,37 +100,42 @@ def collect_episode_urls(program, max_pages):
 
     print("==== COLLECTING:", program["name"], "====")
 
-    # 第 1 頁：首頁
+    # Page 1: programme home page
     print("FETCH HOME:", program["home_url"])
     try:
-        html = fetch(program["home_url"])
+        html = fetch(program["home_url"], referer=program["home_url"])
         ids = extract_episode_ids_from_html(html)
         print("FOUND HOME:", len(ids))
+
         for episode_id in ids:
             urls.add(program["episode_base"] + episode_id)
+
     except Exception as e:
         print("HOME FETCH ERROR:", e)
 
-    # 第 2 頁起：catchUp API
     empty_or_duplicate_count = 0
 
+    # Page 2 onward: real catchUp API
     for page in range(2, max_pages + 1):
         api_url = (
             f"{CATCHUP_BASE}"
             f"?c=radio1"
             f"&p={program['programme_code']}"
             f"&page={page}"
+            f"&m="
         )
 
         print("FETCH CATCHUP:", api_url)
 
         try:
-            html = fetch(api_url)
+            html = fetch(api_url, referer=program["home_url"])
         except Exception as e:
             print("CATCHUP FETCH ERROR:", api_url, e)
             empty_or_duplicate_count += 1
+
             if empty_or_duplicate_count >= 2:
                 break
+
             continue
 
         ids = extract_episode_ids_from_html(html)
@@ -142,7 +155,6 @@ def collect_episode_urls(program, max_pages):
         else:
             empty_or_duplicate_count = 0
 
-        # 連續兩頁沒有新資料，就停
         if empty_or_duplicate_count >= 2:
             print("STOP: no new episodes for 2 pages")
             break
@@ -192,10 +204,10 @@ def extract_hosts_and_index(lines):
     host_index = -1
     hosts = ""
 
-    # 取最後一個主持行，避免抓到頁面前方的最新 / 重溫列表
+    # Use the last host line to avoid grabbing latest/catchup sidebar content.
     for i, line in enumerate(lines):
         if "主持" in line and ("：" in line or ":" in line):
-            value = re.sub(r"^.*?主持人?\s*[:：]\s*", "", line)
+            value = re.sub(r"^.?主持人?\s[:：]\s*", "", line)
             value = clean(value)
 
             if value:
@@ -243,7 +255,7 @@ def extract_date_near_host(lines, host_index):
 
 
 def extract_detail(url, programme_name):
-    html = fetch(url)
+    html = fetch(url, referer=url)
     soup = BeautifulSoup(html, "html.parser")
 
     text = soup.get_text("\n")
@@ -297,10 +309,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
-    parser.add_argument("--max-pages", type=int, default=30)
+    parser.add_argument("--max-pages", type=int, default=40)
     args = parser.parse_args()
 
-    print("RUNNING CATCHUP API VERSION")
+    print("RUNNING REAL CATCHUP ENDPOINT VERSION")
 
     start = datetime.fromisoformat(args.start).date()
     end = datetime.fromisoformat(args.end).date()
@@ -373,3 +385,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
