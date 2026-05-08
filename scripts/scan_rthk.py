@@ -75,10 +75,9 @@ def parse_date(text):
     return None
 
 
-def extract_episode_ids_from_html(raw):
-    episode_ids = set()
+def extract_episode_ids(raw):
+    episode_ids = []
 
-    # 1. catchUp API: JSON format, usually {"status":"1","content":[{"id":"1081669", ...}]}
     try:
         data = json.loads(raw)
 
@@ -87,127 +86,69 @@ def extract_episode_ids_from_html(raw):
                 if isinstance(item, dict):
                     episode_id = item.get("id")
                     if episode_id and str(episode_id).isdigit():
-                        episode_ids.add(str(episode_id))
-
-        # Fallback recursive search for any numeric id-like fields
-        def walk(obj):
-            if isinstance(obj, dict):
-                for key, value in obj.items():
-                    if key in {"id", "episode", "episode_id", "eid", "pid"}:
-                        if str(value).isdigit() and len(str(value)) >= 6:
-                            episode_ids.add(str(value))
-                    else:
-                        walk(value)
-            elif isinstance(obj, list):
-                for value in obj:
-                    walk(value)
-
-        walk(data)
+                        episode_ids.append(str(episode_id))
 
     except Exception:
         pass
 
-    # 2. HTML / escaped HTML fallback
+    if episode_ids:
+        return episode_ids
+
     candidates = [raw, html_lib.unescape(raw)]
 
+    found = set()
+
     for text in candidates:
-        # data-episode="1096938"
         for match in re.finditer(r'data-episode=["\'](\d+)["\']', text):
-            episode_ids.add(match.group(1))
+            found.add(match.group(1))
 
-        # data-episode=\"1096938\"
-        for match in re.finditer(r'data-episode=\\?["\'](\d+)\\?["\']', text):
-            episode_ids.add(match.group(1))
-
-        # /episode/1096938
         for match in re.finditer(r"/episode/(\d+)", text):
-            episode_ids.add(match.group(1))
+            found.add(match.group(1))
 
-        # episode_id / eid / pid / id style fields
         for match in re.finditer(
             r"(?:episode|episode_id|pid|eid|id)[\"'\s:=]+(\d{6,})",
             text,
             re.I,
         ):
-            episode_ids.add(match.group(1))
+            found.add(match.group(1))
 
-    return episode_ids
+    return sorted(found)
 
 
-def collect_episode_urls(program, max_pages):
-    urls = set()
-
-    print("==== COLLECTING:", program["name"], "====")
-
-    # Page 1: programme home page
+def fetch_home_episode_ids(program):
     print("FETCH HOME:", program["home_url"])
 
     try:
-        html = fetch(program["home_url"], referer=program["home_url"])
-        ids = extract_episode_ids_from_html(html)
+        raw = fetch(program["home_url"], referer=program["home_url"])
+        ids = extract_episode_ids(raw)
         print("FOUND HOME:", len(ids))
-
-        for episode_id in ids:
-            urls.add(program["episode_base"] + episode_id)
+        return ids
 
     except Exception as error:
         print("HOME FETCH ERROR:", error)
+        return []
 
-    empty_or_duplicate_count = 0
 
-    # Page 2 onward: real catchUp API
-    for page in range(2, max_pages + 1):
-        api_url = (
-            f"{CATCHUP_BASE}"
-            f"?c=radio1"
-            f"&p={program['programme_code']}"
-            f"&page={page}"
-            f"&m="
-        )
+def fetch_catchup_episode_ids(program, page):
+    api_url = (
+        f"{CATCHUP_BASE}"
+        f"?c=radio1"
+        f"&p={program['programme_code']}"
+        f"&page={page}"
+        f"&m="
+    )
 
-        print("FETCH CATCHUP:", api_url)
+    print("FETCH CATCHUP:", api_url)
 
-        try:
-            raw = fetch(api_url, referer=program["home_url"])
-            print("CATCHUP RESPONSE HEAD:", raw[:300].replace("\n", " "))
-        except Exception as error:
-            print("CATCHUP FETCH ERROR:", api_url, error)
-            empty_or_duplicate_count += 1
-
-            if empty_or_duplicate_count >= 2:
-                break
-
-            continue
-
-        ids = extract_episode_ids_from_html(raw)
+    try:
+        raw = fetch(api_url, referer=program["home_url"])
+        ids = extract_episode_ids(raw)
         print(f"FOUND PAGE {page}:", len(ids))
+        return ids
 
-        before = len(urls)
-
-        for episode_id in ids:
-            urls.add(program["episode_base"] + episode_id)
-
-        after = len(urls)
-
-        if len(ids) == 0:
-            empty_or_duplicate_count += 1
-        elif after == before:
-            empty_or_duplicate_count += 1
-        else:
-            empty_or_duplicate_count = 0
-
-        if empty_or_duplicate_count >= 2:
-            print("STOP: no new episodes for 2 pages")
-            break
-
-        time.sleep(0.5)
-
-    print(program["name"], "total episode URLs:", len(urls))
-
-    for url in sorted(urls):
-        print("EPISODE:", url)
-
-    return sorted(urls)
+    except Exception as error:
+        print("CATCHUP FETCH ERROR:", api_url, error)
+        return []
 
 
 def is_noise_line(line):
@@ -245,7 +186,6 @@ def extract_hosts_and_index(lines):
     host_index = -1
     hosts = ""
 
-    # Use the last host line to avoid latest/catchup sidebar content.
     for index, line in enumerate(lines):
         if "主持" in line and ("：" in line or ":" in line):
             value = re.sub(r"^.?主持人?\s[:：]\s*", "", line)
@@ -346,33 +286,31 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--start", required=True)
-    parser.add_argument("--end", required=True)
-    parser.add_argument("--max-pages", type=int, default=40)
-    args = parser.parse_args()
-
-    print("RUNNING JSON ID CATCHUP PARSER VERSION")
-
-    start = datetime.fromisoformat(args.start).date()
-    end = datetime.fromisoformat(args.end).date()
-
-    os.makedirs("output", exist_ok=True)
+def process_program(program, start_date, end_date, max_pages, seen_urls):
+    print("==== COLLECTING:", program["name"], "====")
 
     all_rows = []
     matched_rows = []
     error_rows = []
 
-    seen_urls = set()
+    stop_program = False
 
-    for program in PROGRAMS:
-        episode_urls = collect_episode_urls(
-            program,
-            max_pages=args.max_pages,
-        )
+    for page in range(1, max_pages + 1):
+        if page == 1:
+            episode_ids = fetch_home_episode_ids(program)
+        else:
+            episode_ids = fetch_catchup_episode_ids(program, page)
 
-        for url in episode_urls:
+        if not episode_ids:
+            print("STOP: no episode ids on page", page)
+            break
+
+        old_count_on_page = 0
+        useful_count_on_page = 0
+
+        for episode_id in episode_ids:
+            url = program["episode_base"] + episode_id
+
             if url in seen_urls:
                 continue
 
@@ -397,18 +335,71 @@ def main():
 
             if not row["date"]:
                 row["error"] = "date_not_found"
+                error_rows.append(row)
                 all_rows.append(row)
                 continue
 
             episode_date = datetime.fromisoformat(row["date"]).date()
 
-            if start <= episode_date <= end:
+            if episode_date < start_date:
+                old_count_on_page += 1
+                print("OLDER THAN START DATE:", episode_date, url)
+                continue
+
+            if start_date <= episode_date <= end_date:
+                useful_count_on_page += 1
                 all_rows.append(row)
 
                 if row["matched"]:
                     matched_rows.append(row)
 
-            time.sleep(0.5)
+            time.sleep(0.4)
+
+        # 如果一整頁都是早過 start_date 的舊資料，就停止該節目。
+        if old_count_on_page > 0 and useful_count_on_page == 0:
+            print("STOP PROGRAM: page is older than start date")
+            stop_program = True
+
+        if stop_program:
+            break
+
+        time.sleep(0.5)
+
+    return all_rows, matched_rows, error_rows
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start", required=True)
+    parser.add_argument("--end", required=True)
+    parser.add_argument("--max-pages", type=int, default=20)
+    args = parser.parse_args()
+
+    print("RUNNING DATE-LIMITED CATCHUP VERSION")
+
+    start_date = datetime.fromisoformat(args.start).date()
+    end_date = datetime.fromisoformat(args.end).date()
+
+    os.makedirs("output", exist_ok=True)
+
+    all_rows = []
+    matched_rows = []
+    error_rows = []
+
+    seen_urls = set()
+
+    for program in PROGRAMS:
+        program_all, program_matched, program_errors = process_program(
+            program=program,
+            start_date=start_date,
+            end_date=end_date,
+            max_pages=args.max_pages,
+            seen_urls=seen_urls,
+        )
+
+        all_rows.extend(program_all)
+        matched_rows.extend(program_matched)
+        error_rows.extend(program_errors)
 
     all_rows.sort(key=lambda row: (row["date"], row["programme"], row["title"]))
     matched_rows.sort(key=lambda row: (row["date"], row["programme"], row["title"]))
