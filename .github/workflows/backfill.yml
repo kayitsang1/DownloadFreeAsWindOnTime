@@ -34,3 +34,9 @@ jobs:
        with:
          name: rthk-scan-results
          path: output/*.csv
+
+     - run: |
+          python scripts/scan_rthk.py \
+      --start "${{ github.event.inputs.start_date }}" \
+      --end "${{ github.event.inputs.end_date }}" \
+      --max-pages 40
