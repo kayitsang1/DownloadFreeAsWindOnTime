@@ -30,7 +30,7 @@ CATCHUP_BASE = "https://www.rthk.hk/radio/catchUp"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json, text/javascript, /; q=0.01",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
     "X-Requested-With": "XMLHttpRequest",
 }
 
@@ -207,7 +207,7 @@ def extract_hosts_and_index(lines):
     # Use the last host line to avoid grabbing latest/catchup sidebar content.
     for i, line in enumerate(lines):
         if "主持" in line and ("：" in line or ":" in line):
-            value = re.sub(r"^.?主持人?\s[:：]\s*", "", line)
+            value = re.sub(r"^.*?主持人?\s*[:：]\s*", "", line)
             value = clean(value)
 
             if value:
@@ -385,4 +385,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
