@@ -4,6 +4,7 @@ import os
 import re
 import time
 from datetime import datetime
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -14,18 +15,23 @@ KEYWORDS = ["馬鼎盛", "马鼎盛"]
 PROGRAMS = [
     {
         "name": "sunday",
-        "url": "https://www.rthk.hk/radio/radio1/programme/free_as_the_wind_sunday",
-        "base": "https://www.rthk.hk/radio/radio1/programme/free_as_the_wind_sunday/episode/",
+        "programme_code": "free_as_the_wind_sunday",
+        "home_url": "https://www.rthk.hk/radio/radio1/programme/free_as_the_wind_sunday",
+        "episode_base": "https://www.rthk.hk/radio/radio1/programme/free_as_the_wind_sunday/episode/",
     },
     {
         "name": "monday",
-        "url": "https://www.rthk.hk/radio/radio1/programme/Free_as_the_wind",
-        "base": "https://www.rthk.hk/radio/radio1/programme/Free_as_the_wind/episode/",
+        "programme_code": "Free_as_the_wind",
+        "home_url": "https://www.rthk.hk/radio/radio1/programme/Free_as_the_wind",
+        "episode_base": "https://www.rthk.hk/radio/radio1/programme/Free_as_the_wind/episode/",
     },
 ]
 
+CATCHUP_BASE = "https://www.rthk.hk/radio/radio1/programme/catchUp"
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0"
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://www.rthk.hk/",
 }
 
 
@@ -63,60 +69,87 @@ def parse_date(text):
     return None
 
 
-def extract_episode_urls_from_html(program, max_pages=30):
-    """
-    RTHK 節目頁每頁大約 10 集。
-    data-nextpage="2" 對應下一批資料。
-    這裡用 ?start=0,10,20... 嘗試抓歷史頁。
-    max_pages=30 即最多抓約 300 集，足夠半年回溯。
-    """
+def extract_episode_ids_from_html(html):
+    episode_ids = set()
+
+    # 主要來源：data-episode="1096938"
+    for m in re.finditer(r'data-episode=["\'](\d+)["\']', html):
+        episode_ids.add(m.group(1))
+
+    # 後備：/episode/1096938
+    for m in re.finditer(r"/episode/(\d+)", html):
+        episode_ids.add(m.group(1))
+
+    # 後備：episode_id / eid / pid 之類
+    for m in re.finditer(r"(?:episode|episode_id|pid|eid)[\"'\s:=]+(\d{6,})", html, re.I):
+        episode_ids.add(m.group(1))
+
+    return episode_ids
+
+
+def collect_episode_urls(program, max_pages):
     urls = set()
 
-    for offset in range(0, max_pages * 10, 10):
-        page_url = f"{program['url']}?start={offset}"
-        print("FETCH PAGE:", page_url)
+    print("==== COLLECTING:", program["name"], "====")
+
+    # 第 1 頁：首頁
+    print("FETCH HOME:", program["home_url"])
+    try:
+        html = fetch(program["home_url"])
+        ids = extract_episode_ids_from_html(html)
+        print("FOUND HOME:", len(ids))
+        for episode_id in ids:
+            urls.add(program["episode_base"] + episode_id)
+    except Exception as e:
+        print("HOME FETCH ERROR:", e)
+
+    # 第 2 頁起：catchUp API
+    empty_or_duplicate_count = 0
+
+    for page in range(2, max_pages + 1):
+        api_url = (
+            f"{CATCHUP_BASE}"
+            f"?c=radio1"
+            f"&p={program['programme_code']}"
+            f"&page={page}"
+        )
+
+        print("FETCH CATCHUP:", api_url)
 
         try:
-            html = fetch(page_url)
+            html = fetch(api_url)
         except Exception as e:
-            print("PAGE FETCH ERROR:", page_url, e)
+            print("CATCHUP FETCH ERROR:", api_url, e)
+            empty_or_duplicate_count += 1
+            if empty_or_duplicate_count >= 2:
+                break
             continue
 
-        found_this_page = set()
-
-        # 1. 抓 data-episode="1096938"
-        for m in re.finditer(r'data-episode=["\'](\d+)["\']', html):
-            episode_id = m.group(1)
-            found_this_page.add(program["base"] + episode_id)
-
-        # 2. 後備：抓 /episode/1096938
-        for m in re.finditer(r"/episode/(\d+)", html):
-            episode_id = m.group(1)
-            found_this_page.add(program["base"] + episode_id)
-
-        # 3. 後備：抓 episode_id / eid / pid 類似欄位
-        for m in re.finditer(r"(?:episode|episode_id|pid|eid)[\"'\s:=]+(\d{6,})", html, re.I):
-            episode_id = m.group(1)
-            found_this_page.add(program["base"] + episode_id)
-
-        print(f"FOUND ON PAGE offset={offset}:", len(found_this_page))
+        ids = extract_episode_ids_from_html(html)
+        print(f"FOUND PAGE {page}:", len(ids))
 
         before = len(urls)
-        urls.update(found_this_page)
+
+        for episode_id in ids:
+            urls.add(program["episode_base"] + episode_id)
+
         after = len(urls)
 
-        # 如果連續抓到的都是重複或空頁，可能已到盡頭
-        if offset > 0 and len(found_this_page) == 0:
-            print("STOP: no episode found on this page")
-            break
+        if len(ids) == 0:
+            empty_or_duplicate_count += 1
+        elif after == before:
+            empty_or_duplicate_count += 1
+        else:
+            empty_or_duplicate_count = 0
 
-        if offset > 0 and after == before:
-            print("STOP: no new episode found on this page")
+        # 連續兩頁沒有新資料，就停
+        if empty_or_duplicate_count >= 2:
+            print("STOP: no new episodes for 2 pages")
             break
 
         time.sleep(0.5)
 
-    print(f"{program['name']} total episode URLs:", len(urls))
+    print(program["name"], "total episode URLs:", len(urls))
 
     for u in sorted(urls):
         print("EPISODE:", u)
@@ -159,7 +192,7 @@ def extract_hosts_and_index(lines):
     host_index = -1
     hosts = ""
 
-    # 取最後一個主持行，避免抓到頁面前方的最新 / 重溫資料
+    # 取最後一個主持行，避免抓到頁面前方的最新 / 重溫列表
     for i, line in enumerate(lines):
         if "主持" in line and ("：" in line or ":" in line):
             value = re.sub(r"^.*?主持人?\s*[:：]\s*", "", line)
@@ -176,7 +209,6 @@ def extract_title_near_host(lines, host_index):
     if host_index == -1:
         return ""
 
-    # 標題通常在主持人上一兩行
     for j in range(host_index - 1, -1, -1):
         candidate = clean(lines[j])
 
@@ -195,14 +227,12 @@ def extract_date_near_host(lines, host_index):
     if host_index == -1:
         return None
 
-    # 日期通常在主持人後面二十多行內
     after_host = " ".join(lines[host_index:host_index + 25])
     date = parse_date(after_host)
 
     if date:
         return date
 
-    # 有些頁面日期在主持人之前
     before_host = " ".join(lines[max(0, host_index - 10):host_index + 1])
     date = parse_date(before_host)
 
@@ -223,7 +253,6 @@ def extract_detail(url, programme_name):
     title = extract_title_near_host(lines, host_index)
     date = extract_date_near_host(lines, host_index)
 
-    # 後備：如果附近找不到日期，才掃全文
     if not date:
         date = parse_date(clean(text))
 
@@ -271,7 +300,7 @@ def main():
     parser.add_argument("--max-pages", type=int, default=30)
     args = parser.parse_args()
 
-    print("RUNNING PAGINATION VERSION")
+    print("RUNNING CATCHUP API VERSION")
 
     start = datetime.fromisoformat(args.start).date()
     end = datetime.fromisoformat(args.end).date()
@@ -285,7 +314,7 @@ def main():
     seen_urls = set()
 
     for program in PROGRAMS:
-        episode_urls = extract_episode_urls_from_html(
+        episode_urls = collect_episode_urls(
             program,
             max_pages=args.max_pages,
         )
