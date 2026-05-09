@@ -1,0 +1,49 @@
+name: RTHK Sunday Auto Download
+
+on:
+  schedule:
+    - cron: "0 5 * * 0"
+  workflow_dispatch:
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download Sunday programme if matched
+        env:
+          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          TZ: Asia/Hong_Kong
+        run: |
+          TODAY=$(date +%F)
+          python scripts/scan_rthk.py \
+            --start "$TODAY" \
+            --end "$TODAY" \
+            --max-pages 3 \
+            --download \
+            --drive-upload
+
+      - name: Upload CSV logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rthk-sunday-download-logs
+          path: output/*.csv
+          if-no-files-found: ignore
