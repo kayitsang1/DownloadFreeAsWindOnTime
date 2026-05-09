@@ -2,7 +2,7 @@ name: RTHK Monday Auto Download
 
 on:
   schedule:
-    - cron: "0 17 * * 0"
+    - cron: "0 17 * * 1"
   workflow_dispatch:
 
 jobs:
