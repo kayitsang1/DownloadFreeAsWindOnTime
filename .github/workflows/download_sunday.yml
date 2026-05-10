@@ -33,6 +33,7 @@ jobs:
         run: |
           mkdir -p "$HOME/.config/rclone"
           printf '%s\n' "$RCLONE_CONFIG_CONTENT" > "$HOME/.config/rclone/rclone.conf"
+          echo "Defined rclone remotes:"
           rclone listremotes
 
       - name: Download Sunday MP3 if matched
@@ -51,16 +52,24 @@ jobs:
       - name: Show downloaded files
         run: |
           echo "Downloaded files:"
-          find downloads -type f || true
+          if [ -d downloads ]; then
+            find downloads -type f || true
+          else
+            echo "downloads directory does not exist"
+          fi
 
       - name: Upload to Google Drive via rclone
         run: |
-          rclone copy downloads "drive:freeaswind" \
-            --ignore-existing \
-            --drive-chunk-size 64M \
-            --transfers 2 \
-            --checkers 4 \
-            --progress
+          if [ -d downloads ] && [ "$(find downloads -type f | wc -l)" -gt 0 ]; then
+            rclone copy downloads "drive:freeaswind" \
+              --ignore-existing \
+              --drive-chunk-size 64M \
+              --transfers 2 \
+              --checkers 4 \
+              --progress
+          else
+            echo "No MP3 files downloaded. Skipping upload."
+          fi
 
       - name: Upload logs
         uses: actions/upload-artifact@v4
