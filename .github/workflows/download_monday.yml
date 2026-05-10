@@ -2,6 +2,7 @@ name: RTHK Monday Auto Download
 
 on:
   schedule:
+    # Tuesday 01:00 HKT = Monday 17:00 UTC
     - cron: "0 17 * * 1"
   workflow_dispatch:
 
@@ -10,37 +11,58 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg
+      - name: Install ffmpeg and rclone
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg rclone
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Python dependencies
+      - name: Install Python deps
         run: pip install -r requirements.txt
 
-      - name: Download Monday programme if matched
+      - name: Restore rclone config
         env:
-          GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s\n' "$RCLONE_CONFIG_CONTENT" > "$HOME/.config/rclone/rclone.conf"
+          rclone listremotes
+
+      - name: Download Monday MP3 if matched
+        env:
           TZ: Asia/Hong_Kong
         run: |
-          TODAY=$(date +%F)
+          TARGET_DATE=$(date -d "yesterday" +%F)
+          echo "Checking Monday date: $TARGET_DATE"
           python scripts/scan_rthk.py \
-            --start "$TODAY" \
-            --end "$TODAY" \
-            --max-pages 3 \
+            --start "$TARGET_DATE" \
+            --end "$TARGET_DATE" \
+            --max-pages 5 \
             --download \
-            --drive-upload
+            --download-dir downloads
 
-      - name: Upload CSV logs
+      - name: Show downloaded files
+        run: |
+          echo "Downloaded files:"
+          find downloads -type f || true
+
+      - name: Upload to Google Drive via rclone
+        run: |
+          rclone copy downloads "drive:freeaswind" \
+            --ignore-existing \
+            --drive-chunk-size 64M \
+            --transfers 2 \
+            --checkers 4 \
+            --progress
+
+      - name: Upload logs
         uses: actions/upload-artifact@v4
         if: always()
         with:
