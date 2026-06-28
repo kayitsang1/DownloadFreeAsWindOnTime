@@ -2,7 +2,6 @@ import argparse
 import csv
 import html as html_lib
 import json
-import os
 import re
 import subprocess
 import time
@@ -13,7 +12,7 @@ import requests
 from bs4 import BeautifulSoup
 
 
-print("RUNNING RCLONE-READY MP3 VERSION WITH SUNDAY GENERIC HOST FIX")
+print("RUNNING RCLONE-READY MP3 VERSION WITH HOSTS+GUESTS MATCHING")
 
 KEYWORDS = ["馬鼎盛", "马鼎盛"]
 
@@ -164,6 +163,7 @@ def normalize_text(raw_html):
     text = html_lib.unescape(text)
 
     lines = []
+
     for line in text.splitlines():
         line = line.strip()
         if line:
@@ -172,39 +172,58 @@ def normalize_text(raw_html):
     return lines
 
 
-def extract_hosts_and_index(lines):
-    host_line = ""
-    host_index = -1
+def clean_people_line(line, label):
+    text = line.strip()
+    text = re.sub(rf"^.*?{label}\s*[：:]\s*", "", text)
+    text = text.strip()
+    return text
+
+
+def extract_label_and_index(lines, labels):
+    found_text = ""
+    found_index = -1
 
     for index, line in enumerate(lines):
-        if "主持" not in line:
-            continue
+        for label in labels:
+            if label not in line:
+                continue
 
-        if "：" not in line and ":" not in line:
-            continue
+            if "：" not in line and ":" not in line:
+                continue
 
-        host_line = line
-        host_index = index
+            found_text = clean_people_line(line, label)
+            found_index = index
 
-    hosts = host_line
-
-    hosts = re.sub(r"^.*?主持人?\s*[：:]\s*", "", hosts)
-    hosts = hosts.strip()
-
-    return hosts, host_index
+    return found_text, found_index
 
 
-def extract_title_near_host(lines, host_index):
-    if host_index <= 0:
+def extract_hosts_and_guests(lines):
+    hosts, host_index = extract_label_and_index(lines, ["主持", "主持人"])
+    guests, guest_index = extract_label_and_index(lines, ["嘉賓", "嘉宾"])
+
+    indexes = [idx for idx in [host_index, guest_index] if idx >= 0]
+
+    if indexes:
+        anchor_index = min(indexes)
+    else:
+        anchor_index = -1
+
+    return hosts, guests, anchor_index
+
+
+def extract_title_near_anchor(lines, anchor_index):
+    if anchor_index <= 0:
         return ""
 
     candidates = []
 
-    start = max(0, host_index - 8)
-    end = host_index
+    start = max(0, anchor_index - 8)
+    end = anchor_index
 
     for line in lines[start:end]:
         if "主持" in line:
+            continue
+        if "嘉賓" in line or "嘉宾" in line:
             continue
         if "播放" in line:
             continue
@@ -212,6 +231,7 @@ def extract_title_near_host(lines, host_index):
             continue
         if len(line) > 80:
             continue
+
         candidates.append(line)
 
     if candidates:
@@ -220,12 +240,10 @@ def extract_title_near_host(lines, host_index):
     return ""
 
 
-def extract_date_near_host(lines, host_index):
-    search_lines = []
-
-    if host_index >= 0:
-        start = max(0, host_index - 15)
-        end = min(len(lines), host_index + 15)
+def extract_date_near_anchor(lines, anchor_index):
+    if anchor_index >= 0:
+        start = max(0, anchor_index - 15)
+        end = min(len(lines), anchor_index + 15)
         search_lines = lines[start:end]
     else:
         search_lines = lines
@@ -243,10 +261,14 @@ def extract_date_near_host(lines, host_index):
     return None
 
 
-def is_generic_sunday_hosts(hosts):
-    normalized = hosts
+def is_generic_sunday_hosts(hosts, guests):
+    combined = f"{hosts} {guests}"
+
+    normalized = combined
     normalized = normalized.replace("主持人：", "")
     normalized = normalized.replace("主持：", "")
+    normalized = normalized.replace("嘉賓：", "")
+    normalized = normalized.replace("嘉宾：", "")
     normalized = normalized.replace(" ", "")
     normalized = normalized.replace("　", "")
     normalized = normalized.replace(",", "、")
@@ -265,14 +287,15 @@ def extract_detail(programme_name, episode_url):
     raw = fetch(episode_url)
     lines = normalize_text(raw)
 
-    hosts, host_index = extract_hosts_and_index(lines)
-    title = extract_title_near_host(lines, host_index)
-    episode_date = extract_date_near_host(lines, host_index)
+    hosts, guests, anchor_index = extract_hosts_and_guests(lines)
+    title = extract_title_near_anchor(lines, anchor_index)
+    episode_date = extract_date_near_anchor(lines, anchor_index)
 
-    matched = any(keyword in hosts for keyword in KEYWORDS)
+    matched_text = f"{hosts} {guests}"
+    matched = any(keyword in matched_text for keyword in KEYWORDS)
 
-    if programme_name == "sunday" and is_generic_sunday_hosts(hosts):
-        print("SUNDAY GENERIC HOST LIST DETECTED: treat as not matched")
+    if programme_name == "sunday" and is_generic_sunday_hosts(hosts, guests):
+        print("SUNDAY GENERIC HOST/GUEST LIST DETECTED: treat as not matched")
         matched = False
 
     return {
@@ -280,6 +303,7 @@ def extract_detail(programme_name, episode_url):
         "programme": programme_name,
         "title": title,
         "hosts": hosts,
+        "guests": guests,
         "matched": matched,
         "episode_url": episode_url,
         "error": "",
@@ -336,6 +360,21 @@ def download_mp3(row, download_dir):
     return f"{filename_base}.mp3"
 
 
+def empty_error_row(programme_name, episode_url, error):
+    return {
+        "date": "",
+        "programme": programme_name,
+        "title": "",
+        "hosts": "",
+        "guests": "",
+        "matched": False,
+        "filename": "",
+        "episode_url": episode_url,
+        "download_status": "",
+        "error": error,
+    }
+
+
 def process_program(programme_name, program, start_date, end_date, max_pages):
     rows = []
     errors = []
@@ -345,32 +384,12 @@ def process_program(programme_name, program, start_date, end_date, max_pages):
     try:
         episode_ids.extend(fetch_home_episode_ids(program))
     except Exception as exc:
-        errors.append({
-            "date": "",
-            "programme": programme_name,
-            "title": "",
-            "hosts": "",
-            "matched": False,
-            "filename": "",
-            "episode_url": program["home_url"],
-            "download_status": "",
-            "error": f"home fetch failed: {exc}",
-        })
+        errors.append(empty_error_row(programme_name, program["home_url"], f"home fetch failed: {exc}"))
 
     try:
         episode_ids.extend(fetch_catchup_episode_ids(program, max_pages))
     except Exception as exc:
-        errors.append({
-            "date": "",
-            "programme": programme_name,
-            "title": "",
-            "hosts": "",
-            "matched": False,
-            "filename": "",
-            "episode_url": program["home_url"],
-            "download_status": "",
-            "error": f"catchUp fetch failed: {exc}",
-        })
+        errors.append(empty_error_row(programme_name, program["home_url"], f"catchUp fetch failed: {exc}"))
 
     seen = set()
     unique_episode_ids = []
@@ -405,17 +424,7 @@ def process_program(programme_name, program, start_date, end_date, max_pages):
             rows.append(row)
 
         except Exception as exc:
-            errors.append({
-                "date": "",
-                "programme": programme_name,
-                "title": "",
-                "hosts": "",
-                "matched": False,
-                "filename": "",
-                "episode_url": episode_url,
-                "download_status": "",
-                "error": str(exc),
-            })
+            errors.append(empty_error_row(programme_name, episode_url, str(exc)))
 
         time.sleep(0.3)
 
@@ -428,6 +437,7 @@ def write_csv(path, rows):
         "programme",
         "title",
         "hosts",
+        "guests",
         "matched",
         "filename",
         "episode_url",
