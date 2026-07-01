@@ -12,9 +12,11 @@ import requests
 from bs4 import BeautifulSoup
 
 
-print("RUNNING RCLONE-READY MP3 VERSION WITH HOSTS+GUESTS MATCHING")
+print("RUNNING RCLONE-READY MP3 VERSION - MONDAY MULTI PEOPLE FIELD FIX")
 
 KEYWORDS = ["馬鼎盛", "马鼎盛"]
+
+PEOPLE_LABELS = ["主持人", "主持", "嘉賓", "嘉宾"]
 
 SUNDAY_GENERIC_HOSTS = [
     "馬鼎盛",
@@ -22,7 +24,10 @@ SUNDAY_GENERIC_HOSTS = [
     "文潔華",
     "海林",
     "蘇奭",
+    "蘇頴",
     "邱逸",
+    "鄧達智",
+    "黃仲遠",
 ]
 
 PROGRAMS = {
@@ -172,43 +177,155 @@ def normalize_text(raw_html):
     return lines
 
 
-def clean_people_line(line, label):
-    text = line.strip()
-    text = re.sub(rf"^.*?{label}\s*[：:]\s*", "", text)
-    text = text.strip()
+def normalize_people_text(text):
+    text = text or ""
+    text = text.replace(" ", "")
+    text = text.replace("　", "")
+    text = text.replace(",", "、")
+    text = text.replace("，", "、")
     return text
 
 
-def extract_label_and_index(lines, labels):
-    found_text = ""
-    found_index = -1
+def get_people_label(line):
+    for label in PEOPLE_LABELS:
+        if label in line:
+            return label
+    return None
+
+
+def clean_people_line(line, label):
+    text = line.strip()
+
+    if "：" in text or ":" in text:
+        text = re.sub(rf"^.*?{label}\s*[：:]\s*", "", text)
+        return text.strip()
+
+    return ""
+
+
+def looks_like_stop_line(line):
+    if not line:
+        return True
+
+    if get_people_label(line):
+        return True
+
+    if "播放" in line:
+        return True
+
+    if "Full" in line:
+        return True
+
+    if "Part" in line:
+        return True
+
+    if "第一部份" in line:
+        return True
+
+    if "第二部份" in line:
+        return True
+
+    if re.search(r"\d{1,2}/\d{1,2}/\d{4}", line):
+        return True
+
+    if re.search(r"\d{4}-\d{1,2}-\d{1,2}", line):
+        return True
+
+    if len(line) > 80:
+        return True
+
+    return False
+
+
+def collect_multiline_people_text(lines, start_index, first_text):
+    parts = []
+
+    if first_text:
+        parts.append(first_text)
+
+    for next_index in range(start_index + 1, min(len(lines), start_index + 6)):
+        next_line = lines[next_index].strip()
+
+        if looks_like_stop_line(next_line):
+            break
+
+        parts.append(next_line)
+
+    return "、".join(parts).strip("、 ")
+
+
+def extract_people_items(lines):
+    items = []
 
     for index, line in enumerate(lines):
-        for label in labels:
-            if label not in line:
-                continue
+        label = get_people_label(line)
 
-            if "：" not in line and ":" not in line:
-                continue
+        if not label:
+            continue
 
-            found_text = clean_people_line(line, label)
-            found_index = index
+        first_text = clean_people_line(line, label)
+        text = collect_multiline_people_text(lines, index, first_text)
+        text = text.strip()
 
-    return found_text, found_index
+        if not text:
+            continue
+
+        items.append({
+            "label": label,
+            "text": text,
+            "index": index,
+        })
+
+    return items
 
 
-def extract_hosts_and_guests(lines):
-    hosts, host_index = extract_label_and_index(lines, ["主持", "主持人"])
-    guests, guest_index = extract_label_and_index(lines, ["嘉賓", "嘉宾"])
+def is_generic_sunday_people_text(text):
+    normalized = normalize_people_text(text)
 
-    indexes = [idx for idx in [host_index, guest_index] if idx >= 0]
+    count = 0
+
+    for name in SUNDAY_GENERIC_HOSTS:
+        if name in normalized:
+            count += 1
+
+    return count >= 5
+
+
+def build_people_fields(programme_name, people_items):
+    host_parts = []
+    guest_parts = []
+    match_parts = []
+
+    for item in people_items:
+        label = item["label"]
+        text = item["text"]
+
+        if label in ["主持人", "主持"]:
+            host_parts.append(text)
+
+        if label in ["嘉賓", "嘉宾"]:
+            guest_parts.append(text)
+
+        # 只在星期日忽略固定總名單。
+        # 星期一即使出現多個主持人，也仍然要參與判斷。
+        if programme_name == "sunday" and is_generic_sunday_people_text(text):
+            print("SUNDAY GENERIC PEOPLE LINE IGNORED:", text)
+            continue
+
+        match_parts.append(text)
+
+    hosts = " | ".join(host_parts)
+    guests = " | ".join(guest_parts)
+    matched_text = " ".join(match_parts)
+
+    indexes = [item["index"] for item in people_items]
 
     if indexes:
         anchor_index = min(indexes)
     else:
         anchor_index = -1
 
-    return hosts, guests, anchor_index
+    return hosts, guests, matched_text, anchor_index
 
 
 def extract_title_near_anchor(lines, anchor_index):
@@ -221,14 +338,18 @@ def extract_title_near_anchor(lines, anchor_index):
     end = anchor_index
 
     for line in lines[start:end]:
-        if "主持" in line:
+        if get_people_label(line):
             continue
-        if "嘉賓" in line or "嘉宾" in line:
-            continue
+
         if "播放" in line:
             continue
+
         if re.search(r"\d{1,2}/\d{1,2}/\d{4}", line):
             continue
+
+        if re.search(r"\d{4}-\d{1,2}-\d{1,2}", line):
+            continue
+
         if len(line) > 80:
             continue
 
@@ -243,7 +364,7 @@ def extract_title_near_anchor(lines, anchor_index):
 def extract_date_near_anchor(lines, anchor_index):
     if anchor_index >= 0:
         start = max(0, anchor_index - 15)
-        end = min(len(lines), anchor_index + 15)
+        end = min(len(lines), anchor_index + 25)
         search_lines = lines[start:end]
     else:
         search_lines = lines
@@ -261,42 +382,17 @@ def extract_date_near_anchor(lines, anchor_index):
     return None
 
 
-def is_generic_sunday_hosts(hosts, guests):
-    combined = f"{hosts} {guests}"
-
-    normalized = combined
-    normalized = normalized.replace("主持人：", "")
-    normalized = normalized.replace("主持：", "")
-    normalized = normalized.replace("嘉賓：", "")
-    normalized = normalized.replace("嘉宾：", "")
-    normalized = normalized.replace(" ", "")
-    normalized = normalized.replace("　", "")
-    normalized = normalized.replace(",", "、")
-    normalized = normalized.replace("，", "、")
-
-    count = 0
-
-    for name in SUNDAY_GENERIC_HOSTS:
-        if name in normalized:
-            count += 1
-
-    return count >= 5
-
-
 def extract_detail(programme_name, episode_url):
     raw = fetch(episode_url)
     lines = normalize_text(raw)
 
-    hosts, guests, anchor_index = extract_hosts_and_guests(lines)
+    people_items = extract_people_items(lines)
+    hosts, guests, matched_text, anchor_index = build_people_fields(programme_name, people_items)
+
     title = extract_title_near_anchor(lines, anchor_index)
     episode_date = extract_date_near_anchor(lines, anchor_index)
 
-    matched_text = f"{hosts} {guests}"
     matched = any(keyword in matched_text for keyword in KEYWORDS)
-
-    if programme_name == "sunday" and is_generic_sunday_hosts(hosts, guests):
-        print("SUNDAY GENERIC HOST/GUEST LIST DETECTED: treat as not matched")
-        matched = False
 
     return {
         "date": episode_date.isoformat() if episode_date else "",
