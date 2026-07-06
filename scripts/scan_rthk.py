@@ -12,9 +12,117 @@ import requests
 from bs4 import BeautifulSoup
 
 
-print("RUNNING RCLONE-READY MP3 VERSION - MONDAY MULTI PEOPLE FIELD FIX")
+print("RUNNING RCLONE-READY MP3 VERSION - SUNDAY AUDIO VERIFY WITH CANTONESE HOMOPHONES")
 
 KEYWORDS = ["馬鼎盛", "马鼎盛"]
+
+# 粵音依據：
+# 馬 = maa5
+# 鼎 = ding2
+# 盛 = sing4 / sing6
+#
+# 音訊轉文字可能出現同音字。
+# 判斷規則：
+#   maa5 / ding2 / sing4-or-sing6 三組中，命中兩組或以上，即保留。
+AUDIO_KEYWORDS = [
+    "馬鼎盛",
+    "马鼎盛",
+
+    # maa5 + ding2 + sing4 / sing6 常見組合
+    "馬頂盛",
+    "马顶盛",
+    "馬鼎成",
+    "马鼎成",
+    "馬頂成",
+    "马顶成",
+    "馬鼎城",
+    "马鼎城",
+    "馬頂城",
+    "马顶城",
+    "馬鼎誠",
+    "马鼎诚",
+    "馬頂誠",
+    "马顶诚",
+    "馬鼎承",
+    "马鼎承",
+    "馬頂承",
+    "马顶承",
+    "馬鼎乘",
+    "马鼎乘",
+    "馬頂乘",
+    "马顶乘",
+    "馬鼎繩",
+    "马鼎绳",
+    "馬頂繩",
+    "马顶绳",
+    "馬鼎剩",
+    "马鼎剩",
+    "馬頂剩",
+    "马顶剩",
+
+    # 只識別到後兩字時
+    "鼎盛",
+    "頂盛",
+    "顶盛",
+    "鼎成",
+    "頂成",
+    "顶成",
+    "鼎城",
+    "頂城",
+    "顶城",
+    "鼎誠",
+    "鼎诚",
+    "頂誠",
+    "顶诚",
+    "鼎承",
+    "頂承",
+    "顶承",
+    "鼎乘",
+    "頂乘",
+    "顶乘",
+    "鼎繩",
+    "鼎绳",
+    "頂繩",
+    "顶绳",
+    "鼎剩",
+    "頂剩",
+    "顶剩",
+]
+
+# 以 CUHK 粵語審音配詞字庫音值作分類基礎：
+# 馬：maa5
+# 鼎：ding2
+# 盛：sing4 / sing6
+#
+# 這裡放常見 ASR 可能輸出的同音字。
+# 之後如果你想按 CUHK 字表補齊，可以只擴充這四個 list。
+MAA5_LIKE = [
+    "馬", "马",
+    "碼", "码",
+    "瑪", "玛",
+    "螞", "蚂",
+]
+
+DING2_LIKE = [
+    "鼎",
+    "頂", "顶",
+    "酊",
+]
+
+SING4_LIKE = [
+    "成",
+    "城",
+    "誠", "诚",
+    "承",
+    "乘",
+    "繩", "绳",
+    "盛",
+]
+
+SING6_LIKE = [
+    "盛",
+    "剩",
+]
 
 PEOPLE_LABELS = ["主持人", "主持", "嘉賓", "嘉宾"]
 
@@ -186,6 +294,21 @@ def normalize_people_text(text):
     return text
 
 
+def normalize_transcript(text):
+    text = text or ""
+
+    replacements = [
+        " ", "　", ",", "，", "、", ".", "。", "：", ":", "；", ";",
+        "！", "!", "？", "?", "「", "」", "『", "』", "（", "）", "(", ")",
+        "\n", "\r", "\t",
+    ]
+
+    for item in replacements:
+        text = text.replace(item, "")
+
+    return text
+
+
 def get_people_label(line):
     for label in PEOPLE_LABELS:
         if label in line:
@@ -295,6 +418,7 @@ def build_people_fields(programme_name, people_items):
     host_parts = []
     guest_parts = []
     match_parts = []
+    generic_sunday_detected = False
 
     for item in people_items:
         label = item["label"]
@@ -306,12 +430,12 @@ def build_people_fields(programme_name, people_items):
         if label in ["嘉賓", "嘉宾"]:
             guest_parts.append(text)
 
-        # 只在星期日忽略固定總名單。
-        # 星期一即使出現多個主持人，也仍然要參與判斷。
         if programme_name == "sunday" and is_generic_sunday_people_text(text):
-            print("SUNDAY GENERIC PEOPLE LINE IGNORED:", text)
-            continue
+            generic_sunday_detected = True
+            print("SUNDAY GENERIC PEOPLE LINE DETECTED:", text)
 
+        # 即使星期日疑似固定總名單，仍先讓它 matched。
+        # 最後由音訊核實決定保留或刪除。
         match_parts.append(text)
 
     hosts = " | ".join(host_parts)
@@ -325,7 +449,7 @@ def build_people_fields(programme_name, people_items):
     else:
         anchor_index = -1
 
-    return hosts, guests, matched_text, anchor_index
+    return hosts, guests, matched_text, anchor_index, generic_sunday_detected
 
 
 def extract_title_near_anchor(lines, anchor_index):
@@ -387,7 +511,10 @@ def extract_detail(programme_name, episode_url):
     lines = normalize_text(raw)
 
     people_items = extract_people_items(lines)
-    hosts, guests, matched_text, anchor_index = build_people_fields(programme_name, people_items)
+    hosts, guests, matched_text, anchor_index, generic_sunday_detected = build_people_fields(
+        programme_name,
+        people_items,
+    )
 
     title = extract_title_near_anchor(lines, anchor_index)
     episode_date = extract_date_near_anchor(lines, anchor_index)
@@ -401,7 +528,13 @@ def extract_detail(programme_name, episode_url):
         "hosts": hosts,
         "guests": guests,
         "matched": matched,
+        "generic_sunday_detected": generic_sunday_detected,
         "episode_url": episode_url,
+        "filename": "",
+        "download_status": "",
+        "audio_verified": "",
+        "audio_transcript": "",
+        "audio_match_groups": "",
         "error": "",
     }
 
@@ -453,7 +586,103 @@ def download_mp3(row, download_dir):
         print(result.stdout)
         raise RuntimeError(f"yt-dlp failed with exit code {result.returncode}")
 
-    return f"{filename_base}.mp3"
+    final_path = Path(download_dir) / f"{filename_base}.mp3"
+
+    if not final_path.exists():
+        candidates = list(Path(download_dir).glob(f"{filename_base}.*"))
+        if candidates:
+            final_path = candidates[0]
+
+    return str(final_path)
+
+
+def make_verify_clip(mp3_path, verify_dir, seconds):
+    Path(verify_dir).mkdir(parents=True, exist_ok=True)
+
+    source = Path(mp3_path)
+    clip_path = Path(verify_dir) / f"{source.stem}_first{seconds}s.mp3"
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(source),
+        "-t",
+        str(seconds),
+        "-vn",
+        "-acodec",
+        "libmp3lame",
+        str(clip_path),
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        print(result.stdout)
+        raise RuntimeError(f"ffmpeg clip failed with exit code {result.returncode}")
+
+    return str(clip_path)
+
+
+def transcribe_cantonese_audio(audio_path):
+    from faster_whisper import WhisperModel
+
+    model = WhisperModel(
+        "small",
+        device="cpu",
+        compute_type="int8",
+    )
+
+    segments, info = model.transcribe(
+        audio_path,
+        language="zh",
+        vad_filter=True,
+    )
+
+    texts = []
+
+    for segment in segments:
+        text = segment.text.strip()
+        if text:
+            texts.append(text)
+
+    transcript = " ".join(texts)
+    return transcript
+
+
+def count_cantonese_name_groups(normalized):
+    matched_groups = []
+
+    if any(ch in normalized for ch in MAA5_LIKE):
+        matched_groups.append("maa5")
+
+    if any(ch in normalized for ch in DING2_LIKE):
+        matched_groups.append("ding2")
+
+    if any(ch in normalized for ch in SING4_LIKE + SING6_LIKE):
+        matched_groups.append("sing4_or_sing6")
+
+    return matched_groups
+
+
+def audio_mentions_target(transcript):
+    normalized = normalize_transcript(transcript)
+
+    for keyword in AUDIO_KEYWORDS:
+        if keyword in normalized:
+            return True, "keyword"
+
+    matched_groups = count_cantonese_name_groups(normalized)
+
+    if len(matched_groups) >= 2:
+        return True, ",".join(matched_groups)
+
+    return False, ",".join(matched_groups)
 
 
 def empty_error_row(programme_name, episode_url, error):
@@ -464,9 +693,13 @@ def empty_error_row(programme_name, episode_url, error):
         "hosts": "",
         "guests": "",
         "matched": False,
+        "generic_sunday_detected": "",
         "filename": "",
         "episode_url": episode_url,
         "download_status": "",
+        "audio_verified": "",
+        "audio_transcript": "",
+        "audio_match_groups": "",
         "error": error,
     }
 
@@ -515,7 +748,6 @@ def process_program(programme_name, program, start_date, end_date, max_pages):
                 continue
 
             row["filename"] = safe_filename_from_date(row["date"]) + ".mp3"
-            row["download_status"] = ""
 
             rows.append(row)
 
@@ -535,9 +767,13 @@ def write_csv(path, rows):
         "hosts",
         "guests",
         "matched",
+        "generic_sunday_detected",
         "filename",
         "episode_url",
         "download_status",
+        "audio_verified",
+        "audio_transcript",
+        "audio_match_groups",
         "error",
     ]
 
@@ -559,6 +795,9 @@ def main():
     parser.add_argument("--max-pages", type=int, default=20)
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--download-dir", default="downloads")
+    parser.add_argument("--verify-sunday-audio", action="store_true")
+    parser.add_argument("--verify-seconds", type=int, default=120)
+    parser.add_argument("--verify-dir", default="verify_clips")
 
     args = parser.parse_args()
 
@@ -585,9 +824,42 @@ def main():
     if args.download:
         for row in matched_rows:
             try:
-                filename = download_mp3(row, args.download_dir)
-                row["filename"] = filename
+                downloaded_path = download_mp3(row, args.download_dir)
+                downloaded_file = Path(downloaded_path)
+
+                row["filename"] = downloaded_file.name
                 row["download_status"] = "downloaded"
+
+                if args.verify_sunday_audio and row.get("programme") == "sunday":
+                    print("VERIFYING SUNDAY AUDIO:", downloaded_path)
+
+                    clip_path = make_verify_clip(
+                        mp3_path=downloaded_path,
+                        verify_dir=args.verify_dir,
+                        seconds=args.verify_seconds,
+                    )
+
+                    transcript = transcribe_cantonese_audio(clip_path)
+                    row["audio_transcript"] = transcript
+
+                    print("AUDIO TRANSCRIPT:", transcript)
+
+                    audio_verified, audio_match_groups = audio_mentions_target(transcript)
+                    row["audio_match_groups"] = audio_match_groups
+
+                    if audio_verified:
+                        row["audio_verified"] = "true"
+                        row["download_status"] = "downloaded_audio_verified"
+                        print("AUDIO VERIFIED: keep file")
+                    else:
+                        row["audio_verified"] = "false"
+                        row["download_status"] = "rejected_by_audio_check"
+
+                        if downloaded_file.exists():
+                            downloaded_file.unlink()
+
+                        print("AUDIO NOT VERIFIED: deleted file")
+
             except Exception as exc:
                 row["download_status"] = "failed"
                 row["error"] = str(exc)
