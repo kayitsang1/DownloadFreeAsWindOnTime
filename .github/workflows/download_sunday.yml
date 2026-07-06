@@ -36,7 +36,7 @@ jobs:
           echo "Defined rclone remotes:"
           rclone listremotes
 
-      - name: Download Sunday MP3 if matched
+      - name: Download Sunday MP3 if matched and verify audio
         env:
           TZ: Asia/Hong_Kong
         run: |
@@ -47,7 +47,9 @@ jobs:
             --end "$TODAY" \
             --max-pages 5 \
             --download \
-            --download-dir downloads
+            --download-dir downloads \
+            --verify-sunday-audio \
+            --verify-seconds 120
 
       - name: Show downloaded files
         run: |
@@ -76,5 +78,7 @@ jobs:
         if: always()
         with:
           name: rthk-sunday-download-logs
-          path: output/*.csv
+          path: |
+            output/*.csv
+            verify_clips/*.mp3
           if-no-files-found: ignore
