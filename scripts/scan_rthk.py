@@ -12,23 +12,14 @@ import requests
 from bs4 import BeautifulSoup
 
 
-print("RUNNING RCLONE-READY MP3 VERSION - SUNDAY AUDIO VERIFY WITH CANTONESE HOMOPHONES")
+print("RUNNING RCLONE-READY MP3 VERSION - SUNDAY SMART AUDIO VERIFY")
 
 KEYWORDS = ["馬鼎盛", "马鼎盛"]
 
-# 粵音依據：
-# 馬 = maa5
-# 鼎 = ding2
-# 盛 = sing4 / sing6
-#
-# 音訊轉文字可能出現同音字。
-# 判斷規則：
-#   maa5 / ding2 / sing4-or-sing6 三組中，命中兩組或以上，即保留。
 AUDIO_KEYWORDS = [
     "馬鼎盛",
     "马鼎盛",
 
-    # maa5 + ding2 + sing4 / sing6 常見組合
     "馬頂盛",
     "马顶盛",
     "馬鼎成",
@@ -60,7 +51,6 @@ AUDIO_KEYWORDS = [
     "馬頂剩",
     "马顶剩",
 
-    # 只識別到後兩字時
     "鼎盛",
     "頂盛",
     "顶盛",
@@ -89,13 +79,13 @@ AUDIO_KEYWORDS = [
     "顶剩",
 ]
 
-# 以 CUHK 粵語審音配詞字庫音值作分類基礎：
-# 馬：maa5
-# 鼎：ding2
-# 盛：sing4 / sing6
+# 粵音依據：
+# 馬 = maa5
+# 鼎 = ding2
+# 盛 = sing4 / sing6
 #
-# 這裡放常見 ASR 可能輸出的同音字。
-# 之後如果你想按 CUHK 字表補齊，可以只擴充這四個 list。
+# 音訊轉文字核實：
+# maa5 / ding2 / sing4-or-sing6 三組中，命中兩組或以上，即視為通過。
 MAA5_LIKE = [
     "馬", "马",
     "碼", "码",
@@ -291,6 +281,9 @@ def normalize_people_text(text):
     text = text.replace("　", "")
     text = text.replace(",", "、")
     text = text.replace("，", "、")
+    text = text.replace("/", "、")
+    text = text.replace("／", "、")
+    text = text.replace("|", "、")
     return text
 
 
@@ -402,6 +395,43 @@ def extract_people_items(lines):
     return items
 
 
+def split_people_names(text):
+    normalized = normalize_people_text(text)
+
+    for sep in ["、", "，", ",", "/", "／", "|", "及", "和"]:
+        normalized = normalized.replace(sep, "、")
+
+    parts = [part.strip() for part in normalized.split("、") if part.strip()]
+
+    # 避免重複名字影響人數
+    seen = set()
+    names = []
+
+    for part in parts:
+        if part not in seen:
+            seen.add(part)
+            names.append(part)
+
+    return names
+
+
+def count_people_from_items(people_items):
+    names = []
+
+    for item in people_items:
+        names.extend(split_people_names(item["text"]))
+
+    seen = set()
+    unique_names = []
+
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            unique_names.append(name)
+
+    return len(unique_names), unique_names
+
+
 def is_generic_sunday_people_text(text):
     normalized = normalize_people_text(text)
 
@@ -434,13 +464,13 @@ def build_people_fields(programme_name, people_items):
             generic_sunday_detected = True
             print("SUNDAY GENERIC PEOPLE LINE DETECTED:", text)
 
-        # 即使星期日疑似固定總名單，仍先讓它 matched。
-        # 最後由音訊核實決定保留或刪除。
         match_parts.append(text)
 
     hosts = " | ".join(host_parts)
     guests = " | ".join(guest_parts)
     matched_text = " ".join(match_parts)
+
+    people_count, people_names = count_people_from_items(people_items)
 
     indexes = [item["index"] for item in people_items]
 
@@ -449,7 +479,15 @@ def build_people_fields(programme_name, people_items):
     else:
         anchor_index = -1
 
-    return hosts, guests, matched_text, anchor_index, generic_sunday_detected
+    return {
+        "hosts": hosts,
+        "guests": guests,
+        "matched_text": matched_text,
+        "anchor_index": anchor_index,
+        "generic_sunday_detected": generic_sunday_detected,
+        "people_count": people_count,
+        "people_names": "、".join(people_names),
+    }
 
 
 def extract_title_near_anchor(lines, anchor_index):
@@ -506,29 +544,57 @@ def extract_date_near_anchor(lines, anchor_index):
     return None
 
 
+def decide_match(programme_name, matched_text, generic_sunday_detected, people_count):
+    rthk_name_matched = any(keyword in matched_text for keyword in KEYWORDS)
+
+    if programme_name == "monday":
+        if rthk_name_matched:
+            return True, False, "direct_name_match"
+        return False, False, "not_matched"
+
+    if programme_name == "sunday":
+        suspicious_people_list = generic_sunday_detected or people_count >= 5
+
+        if suspicious_people_list:
+            return True, True, "generic_or_many_people"
+
+        if rthk_name_matched:
+            return True, False, "direct_name_match"
+
+        return False, False, "not_matched"
+
+    return False, False, "not_matched"
+
+
 def extract_detail(programme_name, episode_url):
     raw = fetch(episode_url)
     lines = normalize_text(raw)
 
     people_items = extract_people_items(lines)
-    hosts, guests, matched_text, anchor_index, generic_sunday_detected = build_people_fields(
-        programme_name,
-        people_items,
+    people_fields = build_people_fields(programme_name, people_items)
+
+    title = extract_title_near_anchor(lines, people_fields["anchor_index"])
+    episode_date = extract_date_near_anchor(lines, people_fields["anchor_index"])
+
+    matched, needs_audio_verify, candidate_reason = decide_match(
+        programme_name=programme_name,
+        matched_text=people_fields["matched_text"],
+        generic_sunday_detected=people_fields["generic_sunday_detected"],
+        people_count=people_fields["people_count"],
     )
-
-    title = extract_title_near_anchor(lines, anchor_index)
-    episode_date = extract_date_near_anchor(lines, anchor_index)
-
-    matched = any(keyword in matched_text for keyword in KEYWORDS)
 
     return {
         "date": episode_date.isoformat() if episode_date else "",
         "programme": programme_name,
         "title": title,
-        "hosts": hosts,
-        "guests": guests,
+        "hosts": people_fields["hosts"],
+        "guests": people_fields["guests"],
+        "people_count": people_fields["people_count"],
+        "people_names": people_fields["people_names"],
         "matched": matched,
-        "generic_sunday_detected": generic_sunday_detected,
+        "candidate_reason": candidate_reason,
+        "needs_audio_verify": needs_audio_verify,
+        "generic_sunday_detected": people_fields["generic_sunday_detected"],
         "episode_url": episode_url,
         "filename": "",
         "download_status": "",
@@ -692,7 +758,11 @@ def empty_error_row(programme_name, episode_url, error):
         "title": "",
         "hosts": "",
         "guests": "",
+        "people_count": "",
+        "people_names": "",
         "matched": False,
+        "candidate_reason": "",
+        "needs_audio_verify": "",
         "generic_sunday_detected": "",
         "filename": "",
         "episode_url": episode_url,
@@ -766,7 +836,11 @@ def write_csv(path, rows):
         "title",
         "hosts",
         "guests",
+        "people_count",
+        "people_names",
         "matched",
+        "candidate_reason",
+        "needs_audio_verify",
         "generic_sunday_detected",
         "filename",
         "episode_url",
@@ -830,7 +904,11 @@ def main():
                 row["filename"] = downloaded_file.name
                 row["download_status"] = "downloaded"
 
-                if args.verify_sunday_audio and row.get("programme") == "sunday":
+                if (
+                    args.verify_sunday_audio
+                    and row.get("programme") == "sunday"
+                    and str(row.get("needs_audio_verify")).lower() == "true"
+                ):
                     print("VERIFYING SUNDAY AUDIO:", downloaded_path)
 
                     clip_path = make_verify_clip(
@@ -859,6 +937,9 @@ def main():
                             downloaded_file.unlink()
 
                         print("AUDIO NOT VERIFIED: deleted file")
+
+                elif row.get("programme") == "sunday":
+                    row["audio_verified"] = "not_required"
 
             except Exception as exc:
                 row["download_status"] = "failed"
