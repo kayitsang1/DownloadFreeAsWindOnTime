@@ -12,7 +12,7 @@ import requests
 from bs4 import BeautifulSoup
 
 
-print("RUNNING RCLONE-READY MP3 VERSION - SUNDAY SMART AUDIO VERIFY")
+print("RUNNING RCLONE-READY MP3 VERSION - API DATE FALLBACK + SUNDAY SMART AUDIO VERIFY")
 
 KEYWORDS = ["馬鼎盛", "马鼎盛"]
 
@@ -79,13 +79,6 @@ AUDIO_KEYWORDS = [
     "顶剩",
 ]
 
-# 粵音依據：
-# 馬 = maa5
-# 鼎 = ding2
-# 盛 = sing4 / sing6
-#
-# 音訊轉文字核實：
-# maa5 / ding2 / sing4-or-sing6 三組中，命中兩組或以上，即視為通過。
 MAA5_LIKE = [
     "馬", "马",
     "碼", "码",
@@ -165,12 +158,13 @@ def parse_date(value):
     if not value:
         return None
 
-    value = value.strip()
+    value = str(value).strip()
 
     patterns = [
         "%d/%m/%Y",
         "%Y-%m-%d",
         "%Y/%m/%d",
+        "%d-%m-%Y",
     ]
 
     for pattern in patterns:
@@ -180,6 +174,32 @@ def parse_date(value):
             pass
 
     return None
+
+
+def extract_episode_meta_from_raw(raw):
+    meta = {}
+
+    try:
+        data = json.loads(raw)
+        content = data.get("content", [])
+
+        if isinstance(content, list):
+            for item in content:
+                episode_id = item.get("id")
+                if not episode_id:
+                    continue
+
+                episode_id = str(episode_id)
+
+                meta[episode_id] = {
+                    "api_title": item.get("title", ""),
+                    "api_date": item.get("date", ""),
+                }
+
+    except Exception:
+        pass
+
+    return meta
 
 
 def extract_episode_ids(raw):
@@ -221,6 +241,7 @@ def fetch_home_episode_ids(program):
 
 def fetch_catchup_episode_ids(program, max_pages):
     all_ids = []
+    all_meta = {}
 
     for page in range(1, max_pages + 1):
         params = (
@@ -238,6 +259,9 @@ def fetch_catchup_episode_ids(program, max_pages):
             continue
 
         ids = extract_episode_ids(raw)
+        meta = extract_episode_meta_from_raw(raw)
+
+        all_meta.update(meta)
 
         if not ids:
             break
@@ -253,7 +277,7 @@ def fetch_catchup_episode_ids(program, max_pages):
             seen.add(episode_id)
             unique_ids.append(episode_id)
 
-    return unique_ids
+    return unique_ids, all_meta
 
 
 def normalize_text(raw_html):
@@ -403,7 +427,6 @@ def split_people_names(text):
 
     parts = [part.strip() for part in normalized.split("、") if part.strip()]
 
-    # 避免重複名字影響人數
     seen = set()
     names = []
 
@@ -779,6 +802,7 @@ def process_program(programme_name, program, start_date, end_date, max_pages):
     errors = []
 
     episode_ids = []
+    episode_meta = {}
 
     try:
         episode_ids.extend(fetch_home_episode_ids(program))
@@ -786,7 +810,9 @@ def process_program(programme_name, program, start_date, end_date, max_pages):
         errors.append(empty_error_row(programme_name, program["home_url"], f"home fetch failed: {exc}"))
 
     try:
-        episode_ids.extend(fetch_catchup_episode_ids(program, max_pages))
+        catchup_ids, catchup_meta = fetch_catchup_episode_ids(program, max_pages)
+        episode_ids.extend(catchup_ids)
+        episode_meta.update(catchup_meta)
     except Exception as exc:
         errors.append(empty_error_row(programme_name, program["home_url"], f"catchUp fetch failed: {exc}"))
 
@@ -806,7 +832,19 @@ def process_program(programme_name, program, start_date, end_date, max_pages):
         try:
             row = extract_detail(programme_name, episode_url)
 
+            meta = episode_meta.get(str(episode_id), {})
+            api_date = parse_date(meta.get("api_date", ""))
+            api_title = meta.get("api_title", "")
+
+            if not row["date"] and api_date:
+                row["date"] = api_date.isoformat()
+                print("DATE FALLBACK FROM API:", episode_url, row["date"])
+
+            if not row["title"] and api_title:
+                row["title"] = api_title
+
             if not row["date"]:
+                print("SKIP NO DATE:", episode_url, meta)
                 continue
 
             episode_date = datetime.strptime(row["date"], "%Y-%m-%d").date()
