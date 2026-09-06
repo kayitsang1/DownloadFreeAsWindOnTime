@@ -2,8 +2,10 @@ name: RTHK Monday Auto Download
 
 on:
   schedule:
+    # Monday programme -> check Tuesday 01:00 HKT
     # Tuesday 01:00 HKT = Monday 17:00 UTC
     - cron: "0 17 * * 1"
+
   workflow_dispatch:
 
 jobs:
@@ -24,34 +26,46 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python deps
-        run: pip install -r requirements.txt
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Restore rclone config
         env:
           RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
         run: |
           mkdir -p "$HOME/.config/rclone"
-          printf '%s\n' "$RCLONE_CONFIG_CONTENT" > "$HOME/.config/rclone/rclone.conf"
+
+          printf '%s\n' \
+            "$RCLONE_CONFIG_CONTENT" \
+            > "$HOME/.config/rclone/rclone.conf"
+
           echo "Defined rclone remotes:"
           rclone listremotes
 
-      - name: Download Monday MP3 if matched
+      - name: Download Monday MP3 and verify fallback
         env:
           TZ: Asia/Hong_Kong
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           TARGET_DATE=$(date -d "yesterday" +%F)
+
           echo "Checking Monday date: $TARGET_DATE"
+
           python scripts/scan_rthk.py \
             --start "$TARGET_DATE" \
             --end "$TARGET_DATE" \
             --max-pages 5 \
             --download \
-            --download-dir downloads
+            --download-dir downloads \
+            --verify-audio \
+            --verify-seconds 180
 
       - name: Show downloaded files
         run: |
           echo "Downloaded files:"
+
           if [ -d downloads ]; then
             find downloads -type f || true
           else
@@ -60,13 +74,20 @@ jobs:
 
       - name: Upload to Google Drive via rclone
         run: |
-          if [ -d downloads ] && [ "$(find downloads -type f | wc -l)" -gt 0 ]; then
-            rclone copy downloads "drive:freeaswind" \
+          if [ -d downloads ] && \
+             [ "$(find downloads -type f | wc -l)" -gt 0 ]; then
+
+            echo "Uploading MP3 files to Google Drive..."
+
+            rclone copy \
+              downloads \
+              "drive:freeaswind" \
               --ignore-existing \
               --drive-chunk-size 64M \
               --transfers 2 \
               --checkers 4 \
               --progress
+
           else
             echo "No MP3 files downloaded. Skipping upload."
           fi
@@ -76,5 +97,7 @@ jobs:
         if: always()
         with:
           name: rthk-monday-download-logs
-          path: output/*.csv
+          path: |
+            output/*.csv
+            verify_clips/*.mp3
           if-no-files-found: ignore
