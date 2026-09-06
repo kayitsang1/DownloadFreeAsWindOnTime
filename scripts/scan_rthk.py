@@ -6,2392 +6,763 @@ import os
 import re
 import subprocess
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 
+print("RUNNING RTHK MP3 - EPISODE DETAIL PARSER + GEMINI FALLBACK")
 
-print(
-    "RUNNING RCLONE-READY MP3 VERSION "
-    "- GEMINI CANTONESE AUDIO VERIFY"
-)
-
-KEYWORDS = [
-    "馬鼎盛",
-    "马鼎盛",
-]
-
-# =========================================================
-# 粵音驗證
-#
-# 依據：
-# 馬 = maa5
-# 鼎 = ding2
-# 盛 = sing4 / sing6
-#
-# 原則：
-# Gemini 如果沒有完整輸出「馬鼎盛」，
-# 只要在相近位置依次命中三組中的兩組，
-# 亦視為可能是「馬鼎盛」。
-# =========================================================
-
-MAA5_LIKE = [
-    "馬", "马",
-    "碼", "码",
-    "瑪", "玛",
-    "螞", "蚂",
-]
-
-DING2_LIKE = [
-    "鼎",
-    "頂", "顶",
-    "酊",
-]
-
-SING4_LIKE = [
-    "成",
-    "城",
-    "誠", "诚",
-    "承",
-    "乘",
-    "繩", "绳",
-    "盛",
-]
-
-SING6_LIKE = [
-    "盛",
-    "剩",
-]
-
-SING_LIKE = list(set(SING4_LIKE + SING6_LIKE))
-
-# Gemini custom vocabulary。
-# 這裡刻意以專名為主，不塞大量普通字。
-GEMINI_CUSTOM_VOCABULARY = [
-    "馬鼎盛",
-    "講東講西",
-    "香港電台第一台",
-    "馬恩賜",
-    "文潔華",
-    "海林",
-    "蘇奭",
-    "蘇頴",
-    "邱逸",
-    "鄧達智",
-    "黃仲遠",
-]
-
-
-PEOPLE_LABELS = [
-    "主持人",
-    "主持",
-    "嘉賓",
-    "嘉宾",
-]
-
+KEYWORDS = ["馬鼎盛", "马鼎盛"]
+PEOPLE_LABELS = ["主持人", "主持", "嘉賓", "嘉宾"]
 
 SUNDAY_GENERIC_HOSTS = [
-    "馬鼎盛",
-    "馬恩賜",
-    "文潔華",
-    "海林",
-    "蘇奭",
-    "蘇頴",
-    "邱逸",
-    "鄧達智",
-    "黃仲遠",
+    "馬鼎盛", "馬恩賜", "文潔華", "海林", "蘇奭",
+    "蘇頴", "邱逸", "鄧達智", "黃仲遠",
 ]
 
+GEMINI_CUSTOM_VOCABULARY = [
+    "講東講西", "香港電台第一台", "馬鼎盛", "馬恩賜",
+    "文潔華", "海林", "蘇奭", "蘇頴", "邱逸", "鄧達智", "黃仲遠",
+]
+
+# 馬 maa5 / 鼎 ding2 / 盛 sing4 or sing6
+MAA5_LIKE = ["馬", "马", "碼", "码", "瑪", "玛", "螞", "蚂"]
+DING2_LIKE = ["鼎", "頂", "顶", "酊"]
+SING_LIKE = ["盛", "剩", "成", "城", "誠", "诚", "承", "乘", "繩", "绳"]
 
 PROGRAMS = {
     "sunday": {
         "programme_code": "free_as_the_wind_sunday",
-        "home_url":
-            "https://www.rthk.hk/radio/radio1/programme/"
-            "free_as_the_wind_sunday",
-        "episode_base":
-            "https://www.rthk.hk/radio/radio1/programme/"
-            "free_as_the_wind_sunday/episode/",
+        "home_url": "https://www.rthk.hk/radio/radio1/programme/free_as_the_wind_sunday",
+        "episode_base": "https://www.rthk.hk/radio/radio1/programme/free_as_the_wind_sunday/episode/",
         "weekday": 6,
     },
-
     "monday": {
         "programme_code": "Free_as_the_wind",
-        "home_url":
-            "https://www.rthk.hk/radio/radio1/programme/"
-            "Free_as_the_wind",
-        "episode_base":
-            "https://www.rthk.hk/radio/radio1/programme/"
-            "Free_as_the_wind/episode/",
+        "home_url": "https://www.rthk.hk/radio/radio1/programme/Free_as_the_wind",
+        "episode_base": "https://www.rthk.hk/radio/radio1/programme/Free_as_the_wind/episode/",
         "weekday": 0,
     },
 }
 
-
 CATCHUP_BASE = "https://www.rthk.hk/radio/catchUp"
 
-
-# =========================================================
-# HTTP
-# =========================================================
 
 def fetch(url, referer=None):
     headers = {
         "User-Agent": "Mozilla/5.0",
-        "Accept":
-            "text/html,application/xhtml+xml,"
-            "application/xml,application/json;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml,application/json;q=0.9,*/*;q=0.8",
         "X-Requested-With": "XMLHttpRequest",
     }
-
     if referer:
         headers["Referer"] = referer
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    return r.text
 
-    response = requests.get(
-        url,
-        headers=headers,
-        timeout=30,
-    )
-
-    response.raise_for_status()
-
-    return response.text
-
-
-# =========================================================
-# 日期
-# =========================================================
 
 def parse_date(value):
     if not value:
         return None
-
     value = str(value).strip()
 
-    patterns = [
-        "%d/%m/%Y",
-        "%Y-%m-%d",
-        "%Y/%m/%d",
-        "%d-%m-%Y",
-    ]
-
-    for pattern in patterns:
+    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", value)
+    if m:
+        d, mo, y = m.groups()
         try:
-            return datetime.strptime(
-                value,
-                pattern,
-            ).date()
-
+            return date(int(y), int(mo), int(d))
         except ValueError:
             pass
 
+    m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", value)
+    if m:
+        y, mo, d = m.groups()
+        try:
+            return date(int(y), int(mo), int(d))
+        except ValueError:
+            pass
     return None
 
 
-# =========================================================
-# RTHK API
-# =========================================================
-
-def extract_episode_meta_from_raw(raw):
-    meta = {}
-
-    try:
-        data = json.loads(raw)
-
-        content = data.get(
-            "content",
-            [],
-        )
-
-        if isinstance(content, list):
-
-            for item in content:
-
-                episode_id = item.get("id")
-
-                if not episode_id:
-                    continue
-
-                episode_id = str(
-                    episode_id
-                )
-
-                meta[episode_id] = {
-                    "api_title":
-                        item.get(
-                            "title",
-                            "",
-                        ),
-
-                    "api_date":
-                        item.get(
-                            "date",
-                            "",
-                        ),
-                }
-
-    except Exception:
-        pass
-
-    return meta
-
-
-def extract_episode_ids(raw):
-    episode_ids = []
-
-    try:
-        data = json.loads(raw)
-
-        content = data.get(
-            "content",
-            [],
-        )
-
-        if isinstance(content, list):
-
-            for item in content:
-
-                episode_id = item.get(
-                    "id"
-                )
-
-                if episode_id:
-                    episode_ids.append(
-                        str(episode_id)
-                    )
-
-        if episode_ids:
-            return episode_ids
-
-    except Exception:
-        pass
-
-    episode_ids.extend(
-        re.findall(
-            r'data-episode=["\']?(\d+)',
-            raw,
-        )
-    )
-
-    episode_ids.extend(
-        re.findall(
-            r"/episode/(\d+)",
-            raw,
-        )
-    )
-
-    seen = set()
-    unique_ids = []
-
-    for episode_id in episode_ids:
-
-        if episode_id not in seen:
-
-            seen.add(
-                episode_id
-            )
-
-            unique_ids.append(
-                episode_id
-            )
-
-    return unique_ids
-
-
-def fetch_home_episode_ids(program):
-
-    raw = fetch(
-        program["home_url"]
-    )
-
-    return extract_episode_ids(
-        raw
-    )
-
-
-def fetch_catchup_episode_ids(
-    program,
-    max_pages,
-):
-    all_ids = []
-    all_meta = {}
-
-    for page in range(
-        1,
-        max_pages + 1,
-    ):
-        params = (
-            f"?c=radio1"
-            f"&p={program['programme_code']}"
-            f"&page={page}"
-            f"&m="
-        )
-
-        url = (
-            CATCHUP_BASE
-            + params
-        )
-
-        try:
-            raw = fetch(
-                url,
-                referer=
-                    program["home_url"],
-            )
-
-        except Exception as exc:
-
-            print(
-                f"ERROR fetching "
-                f"catchUp page "
-                f"{page}: {exc}"
-            )
-
-            continue
-
-        ids = extract_episode_ids(
-            raw
-        )
-
-        meta = (
-            extract_episode_meta_from_raw(
-                raw
-            )
-        )
-
-        all_meta.update(
-            meta
-        )
-
-        if not ids:
-            break
-
-        all_ids.extend(
-            ids
-        )
-
-        time.sleep(
-            0.3
-        )
-
-    seen = set()
-    unique_ids = []
-
-    for episode_id in all_ids:
-
-        if episode_id not in seen:
-
-            seen.add(
-                episode_id
-            )
-
-            unique_ids.append(
-                episode_id
-            )
-
-    return (
-        unique_ids,
-        all_meta,
-    )
-
-
-# =========================================================
-# HTML
-# =========================================================
-
-def normalize_text(raw_html):
-
-    soup = BeautifulSoup(
-        raw_html,
-        "html.parser",
-    )
-
-    for tag in soup(
-        ["script", "style"]
-    ):
-        tag.decompose()
-
-    text = soup.get_text(
-        "\n"
-    )
-
-    text = html_lib.unescape(
-        text
-    )
-
-    lines = []
-
-    for line in text.splitlines():
-
-        line = line.strip()
-
-        if line:
-            lines.append(
-                line
-            )
-
-    return lines
-
-
-def normalize_people_text(text):
-
-    text = text or ""
-
-    text = text.replace(
-        " ",
-        "",
-    )
-
-    text = text.replace(
-        "　",
-        "",
-    )
-
-    text = text.replace(
-        ",",
-        "、",
-    )
-
-    text = text.replace(
-        "，",
-        "、",
-    )
-
-    text = text.replace(
-        "/",
-        "、",
-    )
-
-    text = text.replace(
-        "／",
-        "、",
-    )
-
-    text = text.replace(
-        "|",
-        "、",
-    )
-
-    return text
-
-
-def normalize_transcript(text):
-
-    text = text or ""
-
-    replacements = [
-        " ",
-        "　",
-        ",",
-        "，",
-        "、",
-        ".",
-        "。",
-        "：",
-        ":",
-        "；",
-        ";",
-        "！",
-        "!",
-        "？",
-        "?",
-        "「",
-        "」",
-        "『",
-        "』",
-        "（",
-        "）",
-        "(",
-        ")",
-        "\n",
-        "\r",
-        "\t",
+def date_variants(value):
+    d = parse_date(value)
+    if not d:
+        return []
+    return [
+        d.strftime("%d/%m/%Y"),
+        f"{d.day}/{d.month}/{d.year}",
+        d.strftime("%Y-%m-%d"),
+        d.strftime("%Y/%m/%d"),
     ]
 
-    for item in replacements:
 
-        text = text.replace(
-            item,
-            "",
-        )
-
-    return text
-
-
-def get_people_label(line):
-
-    for label in PEOPLE_LABELS:
-
-        if label in line:
-            return label
-
-    return None
-
-
-def clean_people_line(
-    line,
-    label,
-):
-
-    text = line.strip()
-
-    if (
-        "：" in text
-        or ":" in text
-    ):
-
-        text = re.sub(
-            rf"^.*?{label}"
-            rf"\s*[：:]\s*",
-            "",
-            text,
-        )
-
-        return text.strip()
-
-    return ""
-
-
-def looks_like_stop_line(line):
-
-    if not line:
-        return True
-
-    if get_people_label(
-        line
-    ):
-        return True
-
-    # 修正之前把「最新 / LATEST」
-    # 當成人名的問題。
-    if line in [
-        "最新",
-        "LATEST",
-        "Latest",
-    ]:
-        return True
-
-    if "播放" in line:
-        return True
-
-    if "Full" in line:
-        return True
-
-    if "Part" in line:
-        return True
-
-    if "第一部份" in line:
-        return True
-
-    if "第二部份" in line:
-        return True
-
-    if re.search(
-        r"\d{1,2}/\d{1,2}/\d{4}",
-        line,
-    ):
-        return True
-
-    if re.search(
-        r"\d{4}-\d{1,2}-\d{1,2}",
-        line,
-    ):
-        return True
-
-    if len(line) > 80:
-        return True
-
+def range_contains_weekday(start_date, end_date, weekday):
+    d = start_date
+    while d <= end_date:
+        if d.weekday() == weekday:
+            return True
+        d += timedelta(days=1)
     return False
 
 
-def collect_multiline_people_text(
-    lines,
-    start_index,
-    first_text,
-):
+def extract_episode_meta_from_raw(raw):
+    out = {}
+    try:
+        content = json.loads(raw).get("content", [])
+        if isinstance(content, list):
+            for item in content:
+                eid = item.get("id")
+                if eid:
+                    out[str(eid)] = {
+                        "api_title": str(item.get("title") or "").strip(),
+                        "api_date": str(item.get("date") or "").strip(),
+                    }
+    except Exception:
+        pass
+    return out
 
-    parts = []
 
-    if first_text:
-        parts.append(
-            first_text
+def extract_episode_ids(raw):
+    ids = []
+    try:
+        content = json.loads(raw).get("content", [])
+        if isinstance(content, list):
+            ids = [str(x["id"]) for x in content if x.get("id")]
+        if ids:
+            return list(dict.fromkeys(ids))
+    except Exception:
+        pass
+
+    ids += re.findall(r'data-episode=["\']?(\d+)', raw)
+    ids += re.findall(r"/episode/(\d+)", raw)
+    return list(dict.fromkeys(ids))
+
+
+def fetch_home_episode_ids(program):
+    return extract_episode_ids(fetch(program["home_url"]))
+
+
+def fetch_catchup_episode_ids(program, max_pages):
+    ids = []
+    meta = {}
+
+    for page in range(1, max_pages + 1):
+        url = (
+            f"{CATCHUP_BASE}?c=radio1"
+            f"&p={program['programme_code']}&page={page}&m="
         )
+        try:
+            raw = fetch(url, referer=program["home_url"])
+        except Exception as exc:
+            print(f"ERROR catchUp page {page}: {exc}")
+            continue
 
-    for next_index in range(
-        start_index + 1,
-        min(
-            len(lines),
-            start_index + 6,
-        ),
-    ):
+        page_ids = extract_episode_ids(raw)
+        meta.update(extract_episode_meta_from_raw(raw))
 
-        next_line = (
-            lines[next_index]
-            .strip()
-        )
-
-        if looks_like_stop_line(
-            next_line
-        ):
+        if not page_ids:
             break
 
-        parts.append(
-            next_line
-        )
+        ids.extend(page_ids)
+        time.sleep(0.2)
 
-    return "、".join(
-        parts
-    ).strip(
-        "、 "
-    )
+    return list(dict.fromkeys(ids)), meta
 
 
-def extract_people_items(
-    lines,
-):
+def normalize_text(raw_html):
+    soup = BeautifulSoup(raw_html, "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    text = html_lib.unescape(soup.get_text("\n"))
+    return [x.strip() for x in text.splitlines() if x.strip()]
+
+
+def normalize_anchor_text(text):
+    text = html_lib.unescape(str(text or ""))
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[：:，,。.!！?？、\-–—_/／|()（）\[\]【】「」『』]", "", text)
+    return text.lower()
+
+
+def parse_people_line(line):
+    m = re.match(r"^\s*(主持人|主持|嘉賓|嘉宾)\s*[：:]?\s*(.*?)\s*$", line)
+    return (m.group(1), m.group(2).strip()) if m else (None, None)
+
+
+def looks_like_stop_line(line):
+    if not line:
+        return True
+    if parse_people_line(line)[0]:
+        return True
+
+    lower = line.strip().lower()
+    if lower in {"最新", "latest", "節目重溫", "节目重温", "重溫", "重温", "更多", "more"}:
+        return True
+    if any(x in line for x in ["播放", "第一部份", "第二部份", "第一部分", "第二部分"]):
+        return True
+    if re.search(r"\d{1,2}/\d{1,2}/\d{4}", line):
+        return True
+    if re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", line):
+        return True
+    return len(line) > 100
+
+
+def collect_multiline_people_text(lines, start, first_text):
+    parts = [first_text] if first_text else []
+    for i in range(start + 1, min(len(lines), start + 5)):
+        line = lines[i].strip()
+        if looks_like_stop_line(line):
+            break
+        parts.append(line)
+    return "、".join(parts).strip("、 ")
+
+
+def extract_people_items(lines):
     items = []
-
-    for index, line in enumerate(
-        lines
-    ):
-
-        label = get_people_label(
-            line
-        )
-
+    for i, line in enumerate(lines):
+        label, first = parse_people_line(line)
         if not label:
             continue
-
-        first_text = (
-            clean_people_line(
-                line,
-                label,
-            )
-        )
-
-        text = (
-            collect_multiline_people_text(
-                lines,
-                index,
-                first_text,
-            )
-        )
-
-        text = text.strip()
-
-        if not text:
-            continue
-
-        items.append({
-            "label": label,
-            "text": text,
-            "index": index,
-        })
-
+        text = collect_multiline_people_text(lines, i, first)
+        if text:
+            items.append({"label": label, "text": text, "index": i})
     return items
 
 
-def split_people_names(
-    text,
-):
-
-    normalized = (
-        normalize_people_text(
-            text
-        )
-    )
-
-    for sep in [
-        "、",
-        "，",
-        ",",
-        "/",
-        "／",
-        "|",
-        "及",
-        "和",
-    ]:
-
-        normalized = (
-            normalized.replace(
-                sep,
-                "、",
-            )
-        )
-
-    parts = [
-        part.strip()
-        for part
-        in normalized.split("、")
-        if part.strip()
-    ]
-
-    ignore = {
-        "最新",
-        "LATEST",
-        "Latest",
-    }
-
-    seen = set()
+def split_people_names(text):
     names = []
-
-    for part in parts:
-
-        if part in ignore:
+    for part in re.split(r"[、,，/／|]+", str(text or "")):
+        part = re.sub(r"[（(][^）)]*[）)]", "", part).strip()
+        if not part or part.lower() in {"latest", "more"} or part in {"最新", "更多"}:
             continue
-
-        if part not in seen:
-
-            seen.add(
-                part
-            )
-
-            names.append(
-                part
-            )
-
-    return names
+        names.append(part)
+    return list(dict.fromkeys(names))
 
 
-def count_people_from_items(
-    people_items,
-):
-
+def people_names_from_items(items):
     names = []
+    for item in items:
+        names.extend(split_people_names(item["text"]))
+    return list(dict.fromkeys(names))
 
-    for item in people_items:
 
-        names.extend(
-            split_people_names(
-                item["text"]
-            )
-        )
-
-    seen = set()
-    unique_names = []
-
-    for name in names:
-
-        if name not in seen:
-
-            seen.add(
-                name
-            )
-
-            unique_names.append(
-                name
-            )
-
-    return (
-        len(unique_names),
-        unique_names,
+def is_generic_sunday_people_text(text):
+    compact = normalize_anchor_text(text)
+    hits = sum(
+        1 for name in SUNDAY_GENERIC_HOSTS
+        if normalize_anchor_text(name) in compact
     )
+    return hits >= 5
 
 
-def is_generic_sunday_people_text(
-    text,
-):
+def find_episode_scope(lines, expected_date="", expected_title=""):
+    title_indices = []
+    date_indices = []
 
-    normalized = (
-        normalize_people_text(
-            text
+    title_key = normalize_anchor_text(expected_title)
+    if title_key and len(title_key) >= 2:
+        for i, line in enumerate(lines):
+            key = normalize_anchor_text(line)
+            if key and (title_key in key or key in title_key):
+                title_indices.append(i)
+
+    for variant in date_variants(expected_date):
+        for i, line in enumerate(lines):
+            if variant in line:
+                date_indices.append(i)
+
+    title_indices = list(dict.fromkeys(title_indices))
+    date_indices = list(dict.fromkeys(date_indices))
+
+    if title_indices and date_indices:
+        t, d = min(
+            ((t, d) for t in title_indices for d in date_indices),
+            key=lambda x: abs(x[0] - x[1]),
         )
-    )
+        if abs(t - d) <= 80:
+            return max(0, min(t, d) - 20), min(len(lines) - 1, max(t, d) + 30), t, "title+date"
 
-    count = 0
+    if title_indices:
+        a = title_indices[0]
+        return max(0, a - 25), min(len(lines) - 1, a + 35), a, "title"
 
-    for name in (
-        SUNDAY_GENERIC_HOSTS
-    ):
+    if date_indices:
+        a = date_indices[0]
+        return max(0, a - 25), min(len(lines) - 1, a + 35), a, "date"
 
-        if name in normalized:
-            count += 1
+    return 0, -1, -1, "not_found"
 
-    return count >= 5
 
+def select_episode_people_items(programme_name, items, start, end, anchor):
+    if end < start or anchor < 0:
+        return [], False, "no_episode_anchor"
 
-def build_people_fields(
-    programme_name,
-    people_items,
-):
+    scoped = [x for x in items if start <= x["index"] <= end]
+    if not scoped:
+        return [], False, "no_people_near_episode"
 
-    host_parts = []
-    guest_parts = []
-    match_parts = []
-
-    generic_sunday_detected = False
-
-    for item in people_items:
-
-        label = item["label"]
-        text = item["text"]
-
-        if label in [
-            "主持人",
-            "主持",
-        ]:
-
-            host_parts.append(
-                text
-            )
-
-        if label in [
-            "嘉賓",
-            "嘉宾",
-        ]:
-
-            guest_parts.append(
-                text
-            )
-
-        if (
-            programme_name
-            == "sunday"
-            and
-            is_generic_sunday_people_text(
-                text
-            )
-        ):
-
-            generic_sunday_detected = True
-
-            print(
-                "SUNDAY GENERIC "
-                "PEOPLE LINE DETECTED:",
-                text,
-            )
-
-        match_parts.append(
-            text
-        )
-
-    hosts = " | ".join(
-        host_parts
-    )
-
-    guests = " | ".join(
-        guest_parts
-    )
-
-    matched_text = " ".join(
-        match_parts
-    )
-
-    (
-        people_count,
-        people_names,
-    ) = count_people_from_items(
-        people_items
-    )
-
-    indexes = [
-        item["index"]
-        for item
-        in people_items
-    ]
-
-    if indexes:
-        anchor_index = min(
-            indexes
-        )
-    else:
-        anchor_index = -1
-
-    return {
-        "hosts": hosts,
-        "guests": guests,
-        "matched_text":
-            matched_text,
-        "anchor_index":
-            anchor_index,
-        "generic_sunday_detected":
-            generic_sunday_detected,
-        "people_count":
-            people_count,
-        "people_names":
-            "、".join(
-                people_names
-            ),
-    }
-
-
-# =========================================================
-# Title / date
-# =========================================================
-
-def extract_title_near_anchor(
-    lines,
-    anchor_index,
-):
-
-    if anchor_index <= 0:
-        return ""
-
-    candidates = []
-
-    start = max(
-        0,
-        anchor_index - 8,
-    )
-
-    end = anchor_index
-
-    for line in lines[
-        start:end
-    ]:
-
-        if get_people_label(
-            line
-        ):
-            continue
-
-        if "播放" in line:
-            continue
-
-        if re.search(
-            r"\d{1,2}/"
-            r"\d{1,2}/"
-            r"\d{4}",
-            line,
-        ):
-            continue
-
-        if re.search(
-            r"\d{4}-"
-            r"\d{1,2}-"
-            r"\d{1,2}",
-            line,
-        ):
-            continue
-
-        if len(line) > 80:
-            continue
-
-        candidates.append(
-            line
-        )
-
-    if candidates:
-        return candidates[-1]
-
-    return ""
-
-
-def extract_date_near_anchor(
-    lines,
-    anchor_index,
-):
-
-    if anchor_index >= 0:
-
-        start = max(
-            0,
-            anchor_index - 15,
-        )
-
-        end = min(
-            len(lines),
-            anchor_index + 25,
-        )
-
-        search_lines = lines[
-            start:end
-        ]
-
-    else:
-        search_lines = lines
-
-    for line in search_lines:
-
-        match = re.search(
-            r"(\d{1,2}/"
-            r"\d{1,2}/"
-            r"\d{4})",
-            line,
-        )
-
-        if match:
-
-            return parse_date(
-                match.group(1)
-            )
-
-    for line in lines:
-
-        match = re.search(
-            r"(\d{4}-"
-            r"\d{1,2}-"
-            r"\d{1,2})",
-            line,
-        )
-
-        if match:
-
-            return parse_date(
-                match.group(1)
-            )
-
-    return None
-
-
-# =========================================================
-# 篩選規則
-# =========================================================
-
-def decide_match(
-    programme_name,
-    matched_text,
-    generic_sunday_detected,
-    people_count,
-):
-
-    rthk_name_matched = any(
-        keyword in matched_text
-        for keyword in KEYWORDS
-    )
-
-    # 星期一：
-    # 官方名單有馬鼎盛就下載。
-    if programme_name == "monday":
-
-        if rthk_name_matched:
-
-            return (
-                True,
-                False,
-                "direct_name_match",
-            )
-
-        return (
-            False,
-            False,
-            "not_matched",
-        )
-
-    # 星期日：
-    #
-    # 情況一：
-    # 固定總名單或 >= 5 人
-    # → 先下載
-    # → Gemini 音訊核實
-    #
-    # 情況二：
-    # 正常少於 5 人
-    # → 有馬鼎盛才下載
-    # → 不需要音訊核實
     if programme_name == "sunday":
+        non_generic = [x for x in scoped if not is_generic_sunday_people_text(x["text"])]
+        if non_generic:
+            scoped = non_generic
+        else:
+            return scoped, False, "generic_roster_near_episode"
 
-        suspicious_people_list = (
-            generic_sunday_detected
-            or people_count >= 5
-        )
+    if min(abs(x["index"] - anchor) for x in scoped) > 35:
+        return [], False, "people_too_far_from_episode"
 
-        if suspicious_people_list:
+    nearest = min(scoped, key=lambda x: abs(x["index"] - anchor))["index"]
+    block = [x for x in scoped if abs(x["index"] - nearest) <= 12]
 
-            return (
-                True,
-                True,
-                "generic_or_many_people",
-            )
-
-        if rthk_name_matched:
-
-            return (
-                True,
-                False,
-                "direct_name_match",
-            )
-
-        return (
-            False,
-            False,
-            "not_matched",
-        )
-
-    return (
-        False,
-        False,
-        "not_matched",
-    )
+    if not block:
+        return [], False, "no_local_people_block"
+    return block, True, "episode_detail"
 
 
-def extract_detail(
-    programme_name,
-    episode_url,
-):
+def build_people_fields(items):
+    hosts, guests, text = [], [], []
 
-    raw = fetch(
-        episode_url
-    )
+    for item in items:
+        if item["label"] in {"主持人", "主持"}:
+            hosts.append(item["text"])
+        if item["label"] in {"嘉賓", "嘉宾"}:
+            guests.append(item["text"])
+        text.append(item["text"])
 
-    lines = normalize_text(
-        raw
-    )
-
-    people_items = (
-        extract_people_items(
-            lines
-        )
-    )
-
-    people_fields = (
-        build_people_fields(
-            programme_name,
-            people_items,
-        )
-    )
-
-    title = (
-        extract_title_near_anchor(
-            lines,
-            people_fields[
-                "anchor_index"
-            ],
-        )
-    )
-
-    episode_date = (
-        extract_date_near_anchor(
-            lines,
-            people_fields[
-                "anchor_index"
-            ],
-        )
-    )
-
-    (
-        matched,
-        needs_audio_verify,
-        candidate_reason,
-    ) = decide_match(
-        programme_name=
-            programme_name,
-
-        matched_text=
-            people_fields[
-                "matched_text"
-            ],
-
-        generic_sunday_detected=
-            people_fields[
-                "generic_sunday_detected"
-            ],
-
-        people_count=
-            people_fields[
-                "people_count"
-            ],
-    )
-
+    names = people_names_from_items(items)
     return {
-        "date":
-            episode_date.isoformat()
-            if episode_date
-            else "",
-
-        "programme":
-            programme_name,
-
-        "title":
-            title,
-
-        "hosts":
-            people_fields["hosts"],
-
-        "guests":
-            people_fields["guests"],
-
-        "people_count":
-            people_fields[
-                "people_count"
-            ],
-
-        "people_names":
-            people_fields[
-                "people_names"
-            ],
-
-        "matched":
-            matched,
-
-        "candidate_reason":
-            candidate_reason,
-
-        "needs_audio_verify":
-            needs_audio_verify,
-
-        "generic_sunday_detected":
-            people_fields[
-                "generic_sunday_detected"
-            ],
-
-        "episode_url":
-            episode_url,
-
-        "filename":
-            "",
-
-        "download_status":
-            "",
-
-        "audio_verified":
-            "",
-
-        "audio_transcript":
-            "",
-
-        "audio_match_groups":
-            "",
-
-        "error":
-            "",
+        "hosts": " | ".join(hosts),
+        "guests": " | ".join(guests),
+        "matched_text": " ".join(text),
+        "people_count": len(names),
+        "people_names": "、".join(names),
     }
 
 
-# =========================================================
-# MP3
-# =========================================================
+def decide_match(programme_name, reliable_people, matched_text):
+    page_match = any(x in matched_text for x in KEYWORDS)
 
-def safe_filename_from_date(
-    date_string,
-):
+    if programme_name == "sunday":
+        if reliable_people:
+            if page_match:
+                return True, False, "direct_episode_name_match", True
+            return False, False, "episode_people_no_target", False
 
-    parsed = parse_date(
-        date_string
+        # Only when the episode-specific block cannot be trusted do we use Gemini.
+        return True, True, "episode_people_unavailable_gemini_fallback", page_match
+
+    if page_match:
+        return True, False, "direct_episode_name_match", True
+    return False, False, "episode_people_no_target", False
+
+
+def extract_detail(programme_name, episode_url, expected_date="", expected_title=""):
+    raw = fetch(episode_url)
+    lines = normalize_text(raw)
+    all_items = extract_people_items(lines)
+
+    start, end, anchor, anchor_source = find_episode_scope(
+        lines, expected_date, expected_title
     )
 
-    if not parsed:
-
-        try:
-            parsed = datetime.strptime(
-                date_string,
-                "%Y-%m-%d",
-            ).date()
-
-        except ValueError:
-            return "unknown"
-
-    return parsed.strftime(
-        "%m%d"
+    selected, reliable, people_source = select_episode_people_items(
+        programme_name, all_items, start, end, anchor
     )
 
+    # Keep Monday compatibility with older page layouts.
+    if programme_name == "monday" and not reliable and all_items:
+        selected = all_items
+        reliable = True
+        people_source = "monday_whole_page_fallback"
 
-def download_mp3(
-    row,
-    download_dir,
-):
-
-    episode_url = (
-        row["episode_url"]
+    fields = build_people_fields(selected)
+    matched, needs_verify, reason, page_match = decide_match(
+        programme_name, reliable, fields["matched_text"]
     )
 
-    filename_base = (
-        safe_filename_from_date(
-            row["date"]
-        )
+    fixed_roster = (
+        programme_name == "sunday"
+        and any(is_generic_sunday_people_text(x["text"]) for x in all_items)
     )
 
-    Path(
-        download_dir
-    ).mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    output_template = str(
-        Path(download_dir)
-        / f"{filename_base}.%(ext)s"
-    )
-
-    command = [
-        "yt-dlp",
-        "--no-playlist",
-        "-x",
-        "--audio-format",
-        "mp3",
-        "--audio-quality",
-        "0",
-        "-o",
-        output_template,
-        episode_url,
-    ]
-
-    print(
-        "DOWNLOADING:",
-        episode_url,
-    )
-
-    print(
-        "OUTPUT:",
-        output_template,
-    )
-
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-
-    if result.returncode != 0:
-
-        print(
-            result.stdout
-        )
-
-        raise RuntimeError(
-            "yt-dlp failed "
-            f"with exit code "
-            f"{result.returncode}"
-        )
-
-    final_path = (
-        Path(download_dir)
-        / f"{filename_base}.mp3"
-    )
-
-    if not final_path.exists():
-
-        candidates = list(
-            Path(download_dir)
-            .glob(
-                f"{filename_base}.*"
-            )
-        )
-
-        if candidates:
-            final_path = candidates[0]
-
-    return str(
-        final_path
-    )
-
-
-# =========================================================
-# 音訊截取
-# =========================================================
-
-def make_verify_clip(
-    mp3_path,
-    verify_dir,
-    seconds,
-):
-
-    Path(
-        verify_dir
-    ).mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    source = Path(
-        mp3_path
-    )
-
-    clip_path = (
-        Path(verify_dir)
-        / (
-            f"{source.stem}"
-            f"_first"
-            f"{seconds}s.mp3"
-        )
-    )
-
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(source),
-        "-t",
-        str(seconds),
-        "-vn",
-        "-acodec",
-        "libmp3lame",
-        str(clip_path),
-    ]
-
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-
-    if result.returncode != 0:
-
-        print(
-            result.stdout
-        )
-
-        raise RuntimeError(
-            "ffmpeg clip failed "
-            f"with exit code "
-            f"{result.returncode}"
-        )
-
-    return str(
-        clip_path
-    )
-
-
-# =========================================================
-# Gemini 粵語轉錄
-# =========================================================
-
-def transcribe_cantonese_audio_gemini(
-    audio_path,
-    episode_title="",
-):
-
-    from google import genai
-
-    api_key = os.environ.get(
-        "GEMINI_API_KEY"
-    )
-
-    if not api_key:
-
-        raise RuntimeError(
-            "GEMINI_API_KEY "
-            "is not configured"
-        )
-
-    client = genai.Client(
-        api_key=api_key
-    )
-
-    vocabulary = list(
-        GEMINI_CUSTOM_VOCABULARY
-    )
-
-    # 如果成功取得當集題目，
-    # 一併交給 Gemini 作 vocabulary hint。
-    if (
-        episode_title
-        and episode_title.strip()
-    ):
-
-        vocabulary.append(
-            episode_title.strip()
-        )
-
-    # 去除重複
-    vocabulary = list(
-        dict.fromkeys(
-            vocabulary
-        )
-    )
-
-    uploaded_file = None
-
-    try:
-        print(
-            "UPLOADING VERIFY CLIP "
-            "TO GEMINI:",
-            audio_path,
-        )
-
-        uploaded_file = (
-            client.files.upload(
-                file=audio_path
-            )
-        )
-
-        interaction = (
-            client.interactions.create(
-                model=
-                    "gemini-3.5-transcribe",
-
-                input=[
-                    {
-                        "type":
-                            "audio",
-
-                        "uri":
-                            uploaded_file.uri,
-
-                        "mime_type":
-                            uploaded_file.mime_type,
-                    }
-                ],
-
-                generation_config={
-                    "transcription_config": {
-                        "language_codes": [
-                            "yue-Hant-HK"
-                        ],
-
-                        "custom_vocabulary":
-                            vocabulary,
-
-                        # 要核實原話，
-                        # 不需要 Gemini 幫我們
-                        # 改寫成漂亮文章。
-                        "mode":
-                            "verbatim",
-                    }
-                },
-            )
-        )
-
-        transcript = (
-            interaction.output_text
-            or ""
-        ).strip()
-
-        print(
-            "GEMINI CANTONESE "
-            "TRANSCRIPT:",
-            transcript,
-        )
-
-        return transcript
-
-    finally:
-
-        # 上傳到 Gemini Files API
-        # 的臨時檔案用完即刪。
-        if uploaded_file is not None:
-
-            try:
-                client.files.delete(
-                    name=
-                        uploaded_file.name
-                )
-
-                print(
-                    "GEMINI TEMP FILE "
-                    "DELETED"
-                )
-
-            except Exception as exc:
-
-                print(
-                    "WARNING: could not "
-                    "delete Gemini temp "
-                    f"file: {exc}"
-                )
-
-
-# =========================================================
-# 粵音二組以上核實
-# =========================================================
-
-def get_sound_group(
-    char,
-):
-
-    if char in MAA5_LIKE:
-        return "maa5"
-
-    if char in DING2_LIKE:
-        return "ding2"
-
-    if char in SING_LIKE:
-        return "sing4_or_sing6"
-
-    return None
-
-
-def find_cantonese_name_pair(
-    normalized,
-    max_distance=6,
-):
-    """
-    找出 maa5 → ding2 → sing4/sing6
-    三組中的任何兩組，而且必須：
-      1. 順序合理
-      2. 相距不遠
-
-    避免以前「整段 120 秒任何地方
-    各出現一個字」就誤判。
-    """
-
-    positions = {
-        "maa5": [],
-        "ding2": [],
-        "sing4_or_sing6": [],
-    }
-
-    for index, char in enumerate(
-        normalized
-    ):
-
-        group = get_sound_group(
-            char
-        )
-
-        if group:
-            positions[group].append(
-                index
-            )
-
-    ordered_pairs = [
-        (
-            "maa5",
-            "ding2",
-        ),
-        (
-            "maa5",
-            "sing4_or_sing6",
-        ),
-        (
-            "ding2",
-            "sing4_or_sing6",
-        ),
-    ]
-
-    for (
-        first_group,
-        second_group,
-    ) in ordered_pairs:
-
-        for first_pos in (
-            positions[first_group]
-        ):
-
-            for second_pos in (
-                positions[second_group]
-            ):
-
-                distance = (
-                    second_pos
-                    - first_pos
-                )
-
-                if (
-                    1
-                    <= distance
-                    <= max_distance
-                ):
-
-                    return (
-                        True,
-                        (
-                            f"{first_group}"
-                            f"+"
-                            f"{second_group}"
-                        ),
-                    )
-
-    return (
-        False,
-        "",
-    )
-
-
-def audio_mentions_target(
-    transcript,
-):
-
-    normalized = (
-        normalize_transcript(
-            transcript
-        )
-    )
-
-    # 第一級：
-    # 完整名稱
-    for keyword in KEYWORDS:
-
-        if keyword in normalized:
-
-            return (
-                True,
-                "exact_name",
-            )
-
-    # 第二級：
-    # CUHK 粵音三組中，
-    # 有兩組按合理順序且相近。
-    (
-        matched,
-        groups,
-    ) = find_cantonese_name_pair(
-        normalized,
-        max_distance=6,
-    )
-
-    if matched:
-
-        return (
-            True,
-            groups,
-        )
-
-    return (
-        False,
-        "",
-    )
-
-
-# =========================================================
-# Error row
-# =========================================================
-
-def empty_error_row(
-    programme_name,
-    episode_url,
-    error,
-):
-
-    return {
-        "date": "",
-        "programme":
-            programme_name,
-        "title": "",
-        "hosts": "",
-        "guests": "",
-        "people_count": "",
-        "people_names": "",
-        "matched": False,
-        "candidate_reason": "",
-        "needs_audio_verify": "",
-        "generic_sunday_detected":
-            "",
+    d = parse_date(expected_date)
+
+    row = {
+        "date": d.isoformat() if d else "",
+        "programme": programme_name,
+        "title": expected_title.strip(),
+        "hosts": fields["hosts"],
+        "guests": fields["guests"],
+        "people_count": fields["people_count"],
+        "people_names": fields["people_names"],
+        "page_name_matched": page_match,
+        "matched": matched,
+        "candidate_reason": reason,
+        "needs_audio_verify": needs_verify,
+        "episode_people_reliable": reliable,
+        "people_source": people_source,
+        "anchor_source": anchor_source,
+        "fixed_roster_detected": fixed_roster,
         "filename": "",
-        "episode_url":
-            episode_url,
+        "episode_url": episode_url,
         "download_status": "",
         "audio_verified": "",
         "audio_transcript": "",
         "audio_match_groups": "",
-        "error":
-            error,
+        "error": "",
+    }
+
+    print(
+        f"EPISODE DECISION: {programme_name} date={row['date'] or '?'} "
+        f"anchor={anchor_source} source={people_source} "
+        f"people={row['people_names'] or '(none)'} "
+        f"page_match={page_match} candidate={matched} "
+        f"verify={needs_verify} reason={reason}"
+    )
+    return row
+
+
+def safe_filename_from_date(value):
+    d = parse_date(value)
+    return d.strftime("%m%d") if d else "unknown"
+
+
+def download_mp3(row, download_dir):
+    Path(download_dir).mkdir(parents=True, exist_ok=True)
+    base = safe_filename_from_date(row["date"])
+    template = str(Path(download_dir) / f"{base}.%(ext)s")
+
+    cmd = [
+        "yt-dlp", "--no-playlist", "-x",
+        "--audio-format", "mp3", "--audio-quality", "0",
+        "-o", template, row["episode_url"],
+    ]
+
+    print("DOWNLOADING:", row["episode_url"])
+    print("OUTPUT:", template)
+
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if result.returncode != 0:
+        print(result.stdout)
+        raise RuntimeError(f"yt-dlp failed with exit code {result.returncode}")
+
+    final = Path(download_dir) / f"{base}.mp3"
+    if not final.exists():
+        candidates = list(Path(download_dir).glob(f"{base}.*"))
+        if not candidates:
+            raise RuntimeError("yt-dlp reported success but output file was not found")
+        final = candidates[0]
+    return str(final)
+
+
+def make_verify_clip(mp3_path, verify_dir, seconds):
+    Path(verify_dir).mkdir(parents=True, exist_ok=True)
+    source = Path(mp3_path)
+    clip = Path(verify_dir) / f"{source.stem}_first{seconds}s.mp3"
+
+    cmd = [
+        "ffmpeg", "-y", "-i", str(source), "-t", str(seconds),
+        "-vn", "-acodec", "libmp3lame", str(clip),
+    ]
+
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if result.returncode != 0:
+        print(result.stdout)
+        raise RuntimeError(f"ffmpeg clip failed with exit code {result.returncode}")
+    return str(clip)
+
+
+def transcribe_cantonese_audio_gemini(audio_path, episode_title=""):
+    from google import genai
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+
+    client = genai.Client(api_key=api_key)
+    vocabulary = list(GEMINI_CUSTOM_VOCABULARY)
+    if episode_title:
+        vocabulary.append(episode_title.strip())
+    vocabulary = list(dict.fromkeys(x for x in vocabulary if x))[:100]
+
+    uploaded = None
+    try:
+        print("UPLOADING VERIFY CLIP TO GEMINI:", audio_path)
+        uploaded = client.files.upload(file=audio_path)
+
+        interaction = client.interactions.create(
+            model="gemini-3.5-transcribe",
+            input=[{
+                "type": "audio",
+                "uri": uploaded.uri,
+                "mime_type": uploaded.mime_type,
+            }],
+            generation_config={
+                "transcription_config": {
+                    "language_codes": ["yue-Hant-HK"],
+                    "custom_vocabulary": vocabulary,
+                    "mode": {"type": "verbatim"},
+                }
+            },
+        )
+
+        transcript = (interaction.output_text or "").strip()
+        print("GEMINI CANTONESE TRANSCRIPT:", transcript)
+        return transcript
+
+    finally:
+        if uploaded is not None:
+            try:
+                client.files.delete(name=uploaded.name)
+                print("GEMINI TEMP FILE DELETED")
+            except Exception as exc:
+                print(f"WARNING deleting Gemini temp file: {exc}")
+
+
+def normalize_transcript(text):
+    return re.sub(
+        r"[\s，,。.!！?？、：:；;「」『』（）()\[\]【】]",
+        "",
+        str(text or ""),
+    )
+
+
+def char_group(char):
+    if char in MAA5_LIKE:
+        return "maa5"
+    if char in DING2_LIKE:
+        return "ding2"
+    if char in SING_LIKE:
+        return "sing4_or_sing6"
+    return None
+
+
+def find_cantonese_name_pair(text, max_distance=6):
+    positions = {"maa5": [], "ding2": [], "sing4_or_sing6": []}
+
+    for i, char in enumerate(text):
+        group = char_group(char)
+        if group:
+            positions[group].append(i)
+
+    pairs = [
+        ("maa5", "ding2"),
+        ("maa5", "sing4_or_sing6"),
+        ("ding2", "sing4_or_sing6"),
+    ]
+
+    for a, b in pairs:
+        for pa in positions[a]:
+            for pb in positions[b]:
+                if 1 <= pb - pa <= max_distance:
+                    return True, f"{a}+{b}"
+    return False, ""
+
+
+def audio_mentions_target(transcript):
+    text = normalize_transcript(transcript)
+    if any(x in text for x in KEYWORDS):
+        return True, "exact_name"
+    return find_cantonese_name_pair(text)
+
+
+def empty_error_row(programme, url, error):
+    return {
+        "date": "", "programme": programme, "title": "", "hosts": "", "guests": "",
+        "people_count": "", "people_names": "", "page_name_matched": False,
+        "matched": False, "candidate_reason": "", "needs_audio_verify": "",
+        "episode_people_reliable": "", "people_source": "", "anchor_source": "",
+        "fixed_roster_detected": "", "filename": "", "episode_url": url,
+        "download_status": "", "audio_verified": "", "audio_transcript": "",
+        "audio_match_groups": "", "error": error,
     }
 
 
-# =========================================================
-# Process programme
-# =========================================================
-
-def process_program(
-    programme_name,
-    program,
-    start_date,
-    end_date,
-    max_pages,
-):
-
-    rows = []
-    errors = []
-
-    episode_ids = []
-    episode_meta = {}
+def process_program(programme_name, program, start_date, end_date, max_pages):
+    rows, errors = [], []
+    ids, meta = [], {}
 
     try:
-
-        episode_ids.extend(
-            fetch_home_episode_ids(
-                program
-            )
-        )
-
+        catchup_ids, catchup_meta = fetch_catchup_episode_ids(program, max_pages)
+        ids.extend(catchup_ids)
+        meta.update(catchup_meta)
     except Exception as exc:
-
-        errors.append(
-            empty_error_row(
-                programme_name,
-                program["home_url"],
-                (
-                    "home fetch failed: "
-                    f"{exc}"
-                ),
-            )
-        )
+        errors.append(empty_error_row(programme_name, program["home_url"], f"catchUp failed: {exc}"))
 
     try:
-
-        (
-            catchup_ids,
-            catchup_meta,
-        ) = fetch_catchup_episode_ids(
-            program,
-            max_pages,
-        )
-
-        episode_ids.extend(
-            catchup_ids
-        )
-
-        episode_meta.update(
-            catchup_meta
-        )
-
+        ids.extend(fetch_home_episode_ids(program))
     except Exception as exc:
+        errors.append(empty_error_row(programme_name, program["home_url"], f"home failed: {exc}"))
 
-        errors.append(
-            empty_error_row(
-                programme_name,
-                program["home_url"],
-                (
-                    "catchUp fetch "
-                    f"failed: {exc}"
-                ),
-            )
-        )
+    ids = list(dict.fromkeys(ids))
+    print(f"{programme_name}: found {len(ids)} unique episode IDs")
 
-    seen = set()
-    unique_episode_ids = []
+    for eid in ids:
+        item = meta.get(str(eid), {})
+        api_date = parse_date(item.get("api_date", ""))
+        api_title = item.get("api_title", "")
 
-    for episode_id in episode_ids:
+        # Skip old detail pages before fetching them.
+        if api_date:
+            if api_date < start_date or api_date > end_date:
+                continue
+            if api_date.weekday() != program["weekday"]:
+                continue
 
-        if episode_id not in seen:
-
-            seen.add(
-                episode_id
-            )
-
-            unique_episode_ids.append(
-                episode_id
-            )
-
-    print(
-        f"{programme_name}: "
-        f"found "
-        f"{len(unique_episode_ids)} "
-        f"unique episode IDs"
-    )
-
-    for episode_id in (
-        unique_episode_ids
-    ):
-
-        episode_url = (
-            program["episode_base"]
-            + str(episode_id)
-        )
+        url = program["episode_base"] + str(eid)
 
         try:
-
             row = extract_detail(
                 programme_name,
-                episode_url,
+                url,
+                expected_date=api_date.isoformat() if api_date else "",
+                expected_title=api_title,
             )
-
-            meta = episode_meta.get(
-                str(episode_id),
-                {},
-            )
-
-            api_date = parse_date(
-                meta.get(
-                    "api_date",
-                    "",
-                )
-            )
-
-            api_title = meta.get(
-                "api_title",
-                "",
-            )
-
-            if (
-                not row["date"]
-                and api_date
-            ):
-
-                row["date"] = (
-                    api_date.isoformat()
-                )
-
-                print(
-                    "DATE FALLBACK "
-                    "FROM API:",
-                    episode_url,
-                    row["date"],
-                )
-
-            if (
-                not row["title"]
-                and api_title
-            ):
-
-                row["title"] = (
-                    api_title
-                )
 
             if not row["date"]:
+                # Last-resort date scan for home-only IDs.
+                raw = fetch(url)
+                for line in normalize_text(raw):
+                    d = parse_date(line)
+                    if d:
+                        row["date"] = d.isoformat()
+                        break
 
-                print(
-                    "SKIP NO DATE:",
-                    episode_url,
-                    meta,
-                )
-
+            d = parse_date(row["date"])
+            if not d:
+                print("SKIP NO DATE:", url)
+                continue
+            if d < start_date or d > end_date or d.weekday() != program["weekday"]:
                 continue
 
-            episode_date = (
-                datetime.strptime(
-                    row["date"],
-                    "%Y-%m-%d",
-                ).date()
-            )
-
-            if (
-                episode_date
-                < start_date
-                or episode_date
-                > end_date
-            ):
-                continue
-
-            if (
-                episode_date.weekday()
-                != program["weekday"]
-            ):
-                continue
-
-            row["filename"] = (
-                safe_filename_from_date(
-                    row["date"]
-                )
-                + ".mp3"
-            )
-
-            rows.append(
-                row
-            )
+            row["filename"] = safe_filename_from_date(row["date"]) + ".mp3"
+            rows.append(row)
 
         except Exception as exc:
+            errors.append(empty_error_row(programme_name, url, str(exc)))
 
-            errors.append(
-                empty_error_row(
-                    programme_name,
-                    episode_url,
-                    str(exc),
-                )
-            )
+        time.sleep(0.2)
 
-        time.sleep(
-            0.3
-        )
-
-    return (
-        rows,
-        errors,
-    )
+    return rows, errors
 
 
-# =========================================================
-# CSV
-# =========================================================
-
-def write_csv(
-    path,
-    rows,
-):
-
-    fieldnames = [
-        "date",
-        "programme",
-        "title",
-        "hosts",
-        "guests",
-        "people_count",
-        "people_names",
-        "matched",
-        "candidate_reason",
-        "needs_audio_verify",
-        "generic_sunday_detected",
-        "filename",
-        "episode_url",
-        "download_status",
-        "audio_verified",
-        "audio_transcript",
-        "audio_match_groups",
-        "error",
+def write_csv(path, rows):
+    fields = [
+        "date", "programme", "title", "hosts", "guests", "people_count",
+        "people_names", "page_name_matched", "matched", "candidate_reason",
+        "needs_audio_verify", "episode_people_reliable", "people_source",
+        "anchor_source", "fixed_roster_detected", "filename", "episode_url",
+        "download_status", "audio_verified", "audio_transcript",
+        "audio_match_groups", "error",
     ]
 
-    Path(
-        path
-    ).parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    with open(
-        path,
-        "w",
-        encoding="utf-8-sig",
-        newline="",
-    ) as file:
-
-        writer = csv.DictWriter(
-            file,
-            fieldnames=fieldnames,
-        )
-
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
-
         for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fields})
 
-            clean_row = {
-                field:
-                    row.get(
-                        field,
-                        "",
-                    )
-                for field
-                in fieldnames
-            }
-
-            writer.writerow(
-                clean_row
-            )
-
-
-# =========================================================
-# Main
-# =========================================================
 
 def main():
-
     parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--start",
-        required=True,
-        help=
-            "Start date, YYYY-MM-DD",
-    )
-
-    parser.add_argument(
-        "--end",
-        default=
-            date.today().isoformat(),
-        help=
-            "End date, YYYY-MM-DD",
-    )
-
-    parser.add_argument(
-        "--max-pages",
-        type=int,
-        default=20,
-    )
-
-    parser.add_argument(
-        "--download",
-        action="store_true",
-    )
-
-    parser.add_argument(
-        "--download-dir",
-        default="downloads",
-    )
-
-    parser.add_argument(
-        "--verify-sunday-audio",
-        action="store_true",
-    )
-
-    parser.add_argument(
-        "--verify-seconds",
-        type=int,
-        default=120,
-    )
-
-    parser.add_argument(
-        "--verify-dir",
-        default="verify_clips",
-    )
-
+    parser.add_argument("--start", required=True)
+    parser.add_argument("--end", default=date.today().isoformat())
+    parser.add_argument("--max-pages", type=int, default=20)
+    parser.add_argument("--download", action="store_true")
+    parser.add_argument("--download-dir", default="downloads")
+    parser.add_argument("--verify-sunday-audio", action="store_true")
+    parser.add_argument("--verify-seconds", type=int, default=120)
+    parser.add_argument("--verify-dir", default="verify_clips")
     args = parser.parse_args()
 
-    start_date = (
-        datetime.strptime(
-            args.start,
-            "%Y-%m-%d",
-        ).date()
-    )
+    start = datetime.strptime(args.start, "%Y-%m-%d").date()
+    end = datetime.strptime(args.end, "%Y-%m-%d").date()
 
-    end_date = (
-        datetime.strptime(
-            args.end,
-            "%Y-%m-%d",
-        ).date()
-    )
+    all_rows, all_errors = [], []
 
-    all_rows = []
-    all_errors = []
+    for programme_name, program in PROGRAMS.items():
+        if not range_contains_weekday(start, end, program["weekday"]):
+            print(f"SKIP PROGRAMME {programme_name}: no matching weekday in requested range")
+            continue
 
-    for (
-        programme_name,
-        program,
-    ) in PROGRAMS.items():
-
-        (
-            rows,
-            errors,
-        ) = process_program(
-            programme_name=
-                programme_name,
-
-            program=
-                program,
-
-            start_date=
-                start_date,
-
-            end_date=
-                end_date,
-
-            max_pages=
-                args.max_pages,
+        rows, errors = process_program(
+            programme_name, program, start, end, args.max_pages
         )
+        all_rows.extend(rows)
+        all_errors.extend(errors)
 
-        all_rows.extend(
-            rows
-        )
-
-        all_errors.extend(
-            errors
-        )
-
-    matched_rows = [
-        row
-        for row
-        in all_rows
-        if row.get(
-            "matched"
-        ) is True
-    ]
+    matched_rows = [x for x in all_rows if x.get("matched") is True]
 
     if args.download:
-
         for row in matched_rows:
-
             downloaded_file = None
 
             try:
+                downloaded_path = download_mp3(row, args.download_dir)
+                downloaded_file = Path(downloaded_path)
+                row["filename"] = downloaded_file.name
+                row["download_status"] = "downloaded"
 
-                downloaded_path = (
-                    download_mp3(
-                        row,
-                        args.download_dir,
-                    )
-                )
-
-                downloaded_file = Path(
-                    downloaded_path
-                )
-
-                row["filename"] = (
-                    downloaded_file.name
-                )
-
-                row["download_status"] = (
-                    "downloaded"
-                )
-
-                # =========================
-                # 星期日可疑名單：
-                # Gemini 核實
-                # =========================
-
-                if (
-                    args.verify_sunday_audio
-                    and
-                    row.get(
-                        "programme"
-                    ) == "sunday"
-                    and
-                    str(
-                        row.get(
-                            "needs_audio_verify"
-                        )
-                    ).lower()
-                    == "true"
-                ):
-
-                    print(
-                        "VERIFYING SUNDAY "
-                        "AUDIO WITH GEMINI:",
-                        downloaded_path,
-                    )
-
-                    clip_path = (
-                        make_verify_clip(
-                            mp3_path=
-                                downloaded_path,
-
-                            verify_dir=
-                                args.verify_dir,
-
-                            seconds=
-                                args.verify_seconds,
-                        )
-                    )
-
-                    transcript = (
-                        transcribe_cantonese_audio_gemini(
-                            audio_path=
-                                clip_path,
-
-                            episode_title=
-                                row.get(
-                                    "title",
-                                    "",
-                                ),
-                        )
-                    )
-
-                    row[
-                        "audio_transcript"
-                    ] = transcript
-
-                    (
-                        audio_verified,
-                        audio_match_groups,
-                    ) = (
-                        audio_mentions_target(
-                            transcript
-                        )
-                    )
-
-                    row[
-                        "audio_match_groups"
-                    ] = (
-                        audio_match_groups
-                    )
-
-                    if audio_verified:
-
-                        row[
-                            "audio_verified"
-                        ] = "true"
-
-                        row[
-                            "download_status"
-                        ] = (
-                            "downloaded_"
-                            "gemini_verified"
-                        )
-
-                        print(
-                            "GEMINI AUDIO "
-                            "VERIFIED: "
-                            "keep file"
-                        )
-
-                    else:
-
-                        row[
-                            "audio_verified"
-                        ] = "false"
-
-                        row[
-                            "download_status"
-                        ] = (
-                            "rejected_by_"
-                            "gemini_audio_check"
-                        )
-
-                        if (
-                            downloaded_file
-                            .exists()
-                        ):
-
+                if row["programme"] == "sunday" and row.get("needs_audio_verify") is True:
+                    if not args.verify_sunday_audio:
+                        row["download_status"] = "verification_not_enabled"
+                        if downloaded_file.exists():
                             downloaded_file.unlink()
+                        print("SUNDAY NEEDS GEMINI BUT VERIFY FLAG IS OFF: deleted")
+                        continue
 
-                        print(
-                            "GEMINI AUDIO "
-                            "NOT VERIFIED: "
-                            "deleted file"
-                        )
-
-                elif (
-                    row.get(
-                        "programme"
+                    print("VERIFYING SUNDAY AUDIO WITH GEMINI:", downloaded_path)
+                    clip = make_verify_clip(
+                        downloaded_path, args.verify_dir, args.verify_seconds
                     )
-                    == "sunday"
-                ):
+                    transcript = transcribe_cantonese_audio_gemini(
+                        clip, row.get("title", "")
+                    )
+                    row["audio_transcript"] = transcript
 
-                    row[
-                        "audio_verified"
-                    ] = "not_required"
+                    ok, groups = audio_mentions_target(transcript)
+                    row["audio_match_groups"] = groups
+
+                    if ok:
+                        row["audio_verified"] = "true"
+                        row["download_status"] = "downloaded_gemini_verified"
+                        print("GEMINI VERIFIED: keep file")
+                    else:
+                        row["audio_verified"] = "false"
+                        row["download_status"] = "rejected_by_gemini_audio_check"
+                        if downloaded_file.exists():
+                            downloaded_file.unlink()
+                        print("GEMINI NOT VERIFIED: deleted file")
+
+                elif row["programme"] == "sunday":
+                    row["audio_verified"] = "not_required"
 
             except Exception as exc:
+                row["download_status"] = "failed"
+                row["error"] = str(exc)
 
-                row[
-                    "download_status"
-                ] = "failed"
-
-                row[
-                    "error"
-                ] = str(exc)
-
-                # Gemini / API / verification
-                # 技術失敗時：
-                # 不讓未核實檔案進入 rclone。
                 if (
-                    row.get(
-                        "programme"
-                    )
-                    == "sunday"
-                    and
-                    str(
-                        row.get(
-                            "needs_audio_verify"
-                        )
-                    ).lower()
-                    == "true"
+                    row.get("programme") == "sunday"
+                    and row.get("needs_audio_verify") is True
+                    and downloaded_file is not None
+                    and downloaded_file.exists()
                 ):
+                    downloaded_file.unlink()
+                    print("VERIFY ERROR: unverified Sunday file deleted")
 
-                    if (
-                        downloaded_file
-                        is not None
-                        and
-                        downloaded_file.exists()
-                    ):
+                all_errors.append(row.copy())
 
-                        downloaded_file.unlink()
+    write_csv("output/all_episodes.csv", all_rows)
+    write_csv("output/matched_episodes.csv", matched_rows)
+    write_csv("output/errors.csv", all_errors)
 
-                        print(
-                            "VERIFY ERROR: "
-                            "unverified Sunday "
-                            "file deleted"
-                        )
-
-                all_errors.append(
-                    row.copy()
-                )
-
-    write_csv(
-        "output/all_episodes.csv",
-        all_rows,
-    )
-
-    write_csv(
-        "output/matched_episodes.csv",
-        matched_rows,
-    )
-
-    write_csv(
-        "output/errors.csv",
-        all_errors,
-    )
-
-    print(
-        "DONE"
-    )
-
-    print(
-        f"all rows: "
-        f"{len(all_rows)}"
-    )
-
-    print(
-        f"matched rows: "
-        f"{len(matched_rows)}"
-    )
-
-    print(
-        f"errors: "
-        f"{len(all_errors)}"
-    )
+    print("DONE")
+    print(f"all rows: {len(all_rows)}")
+    print(f"matched rows: {len(matched_rows)}")
+    print(f"errors: {len(all_errors)}")
 
 
 if __name__ == "__main__":
