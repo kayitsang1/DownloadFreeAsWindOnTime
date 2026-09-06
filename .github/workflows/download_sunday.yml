@@ -4,6 +4,7 @@ on:
   schedule:
     # Sunday 13:00 HKT = Sunday 05:00 UTC
     - cron: "0 5 * * 0"
+
   workflow_dispatch:
 
 jobs:
@@ -24,24 +25,33 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python deps
-        run: pip install -r requirements.txt
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Restore rclone config
         env:
           RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
         run: |
           mkdir -p "$HOME/.config/rclone"
-          printf '%s\n' "$RCLONE_CONFIG_CONTENT" > "$HOME/.config/rclone/rclone.conf"
+
+          printf '%s\n' \
+            "$RCLONE_CONFIG_CONTENT" \
+            > "$HOME/.config/rclone/rclone.conf"
+
           echo "Defined rclone remotes:"
           rclone listremotes
 
-      - name: Download Sunday MP3 if matched and verify audio
+      - name: Download Sunday MP3 and verify
         env:
           TZ: Asia/Hong_Kong
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           TODAY=$(date +%F)
+
           echo "Checking Sunday date: $TODAY"
+
           python scripts/scan_rthk.py \
             --start "$TODAY" \
             --end "$TODAY" \
@@ -54,23 +64,42 @@ jobs:
       - name: Show downloaded files
         run: |
           echo "Downloaded files:"
+
           if [ -d downloads ]; then
             find downloads -type f || true
           else
             echo "downloads directory does not exist"
           fi
 
+      - name: Show verification clips
+        if: always()
+        run: |
+          echo "Verification clips:"
+
+          if [ -d verify_clips ]; then
+            find verify_clips -type f || true
+          else
+            echo "verify_clips directory does not exist"
+          fi
+
       - name: Upload to Google Drive via rclone
         run: |
-          if [ -d downloads ] && [ "$(find downloads -type f | wc -l)" -gt 0 ]; then
-            rclone copy downloads "drive:freeaswind" \
+          if [ -d downloads ] && \
+             [ "$(find downloads -type f | wc -l)" -gt 0 ]; then
+
+            echo "Uploading verified MP3 files to Google Drive..."
+
+            rclone copy \
+              downloads \
+              "drive:freeaswind" \
               --ignore-existing \
               --drive-chunk-size 64M \
               --transfers 2 \
               --checkers 4 \
               --progress
+
           else
-            echo "No MP3 files downloaded. Skipping upload."
+            echo "No verified MP3 files. Skipping Google Drive upload."
           fi
 
       - name: Upload logs
