@@ -12,7 +12,7 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-print("RUNNING RTHK MP3 - EPISODE DETAIL PARSER + GEMINI FALLBACK")
+print("RUNNING RTHK MP3 - EPISODE DETAIL PARSER + GEMINI AUDIO UNDERSTANDING C")
 
 KEYWORDS = ["馬鼎盛", "马鼎盛"]
 PEOPLE_LABELS = ["主持人", "主持", "嘉賓", "嘉宾"]
@@ -22,15 +22,30 @@ SUNDAY_GENERIC_HOSTS = [
     "蘇頴", "邱逸", "鄧達智", "黃仲遠",
 ]
 
-GEMINI_CUSTOM_VOCABULARY = [
-    "講東講西", "香港電台第一台", "馬鼎盛", "馬恩賜",
-    "文潔華", "海林", "蘇奭", "蘇頴", "邱逸", "鄧達智", "黃仲遠",
-]
+GEMINI_AUDIO_MODEL = "gemini-3.8-flash"
 
-# 馬 maa5 / 鼎 ding2 / 盛 sing4 or sing6
-MAA5_LIKE = ["馬", "马", "碼", "码", "瑪", "玛", "螞", "蚂"]
-DING2_LIKE = ["鼎", "頂", "顶", "酊"]
-SING_LIKE = ["盛", "剩", "成", "城", "誠", "诚", "承", "乘", "繩", "绳"]
+GEMINI_NAMES_PROMPT = """
+你正在聆聽一段香港粵語電台節目。
+
+請只根據音訊本身回答，不要猜測，也不要利用外部資料。
+
+任務：
+1. 找出節目開始時主持人介紹自己、其他主持或嘉賓的部分。
+2. 列出你實際聽到的所有人名。
+3. 自我介紹的人名也要列出，例如「小弟XXX」。
+4. 對不確定的人名請標示「不確定」。
+5. 不要因為某個名字可能很有名而自行補全。
+6. 使用繁體中文。
+
+最後格式：
+
+聽到的人名：
+- XXX
+- XXX
+
+關鍵原話：
+「……」
+""".strip()
 
 PROGRAMS = {
     "sunday": {
@@ -474,7 +489,14 @@ def make_verify_clip(mp3_path, verify_dir, seconds):
     return str(clip)
 
 
-def transcribe_cantonese_audio_gemini(audio_path, episode_title=""):
+def analyze_cantonese_audio_gemini(audio_path, episode_title=""):
+    """
+    Gemini Audio Understanding - C mode.
+
+    不做完整逐字轉錄，也不直接提示「馬鼎盛」作 yes/no 判斷。
+    只要求 Gemini 從音訊中抽取實際聽到的主持／嘉賓人名，
+    再由本地程式檢查結果是否包含「馬鼎盛」。
+    """
     from google import genai
 
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -482,35 +504,49 @@ def transcribe_cantonese_audio_gemini(audio_path, episode_title=""):
         raise RuntimeError("GEMINI_API_KEY is not configured")
 
     client = genai.Client(api_key=api_key)
-    vocabulary = list(GEMINI_CUSTOM_VOCABULARY)
+
+    prompt = GEMINI_NAMES_PROMPT
     if episode_title:
-        vocabulary.append(episode_title.strip())
-    vocabulary = list(dict.fromkeys(x for x in vocabulary if x))[:100]
+        prompt += (
+            "\n\n補充：這段音訊所屬節目的當集題目可能是："
+            f"「{episode_title.strip()}」。"
+            "這項資訊只用來幫助理解節目段落，不可據此猜測任何人名。"
+        )
 
     uploaded = None
+
     try:
         print("UPLOADING VERIFY CLIP TO GEMINI:", audio_path)
         uploaded = client.files.upload(file=audio_path)
 
+        audio_input = {
+            "type": "audio",
+            "uri": uploaded.uri,
+            "mime_type": uploaded.mime_type,
+        }
+
         interaction = client.interactions.create(
-            model="gemini-3.5-transcribe",
-            input=[{
-                "type": "audio",
-                "uri": uploaded.uri,
-                "mime_type": uploaded.mime_type,
-            }],
-            generation_config={
-                "transcription_config": {
-                    "language_codes": ["yue-Hant-HK"],
-                    "custom_vocabulary": vocabulary,
-                    "mode": {"type": "verbatim"},
-                }
-            },
+            model=GEMINI_AUDIO_MODEL,
+            input=[
+                {
+                    "type": "text",
+                    "text": prompt,
+                },
+                audio_input,
+            ],
         )
 
-        transcript = (interaction.output_text or "").strip()
-        print("GEMINI CANTONESE TRANSCRIPT:", transcript)
-        return transcript
+        result_text = (interaction.output_text or "").strip()
+
+        print("")
+        print("=" * 70)
+        print("GEMINI AUDIO UNDERSTANDING - EXTRACT NAMES")
+        print("=" * 70)
+        print(result_text)
+        print("=" * 70)
+        print("")
+
+        return result_text
 
     finally:
         if uploaded is not None:
@@ -521,7 +557,7 @@ def transcribe_cantonese_audio_gemini(audio_path, episode_title=""):
                 print(f"WARNING deleting Gemini temp file: {exc}")
 
 
-def normalize_transcript(text):
+def normalize_gemini_result(text):
     return re.sub(
         r"[\s，,。.!！?？、：:；;「」『』（）()\[\]【】]",
         "",
@@ -529,43 +565,20 @@ def normalize_transcript(text):
     )
 
 
-def char_group(char):
-    if char in MAA5_LIKE:
-        return "maa5"
-    if char in DING2_LIKE:
-        return "ding2"
-    if char in SING_LIKE:
-        return "sing4_or_sing6"
-    return None
+def audio_analysis_mentions_target(result_text):
+    """
+    C 模式結果只作非常保守的精確名稱比對。
 
+    若 Gemini 列出「馬鼎盛」或「马鼎盛」即視為通過。
+    不再使用 maa5/ding2/sing4 同音字推測，避免增加 false positive。
+    """
+    normalized = normalize_gemini_result(result_text)
 
-def find_cantonese_name_pair(text, max_distance=6):
-    positions = {"maa5": [], "ding2": [], "sing4_or_sing6": []}
+    for keyword in KEYWORDS:
+        if keyword in normalized:
+            return True, "gemini_c_exact_name"
 
-    for i, char in enumerate(text):
-        group = char_group(char)
-        if group:
-            positions[group].append(i)
-
-    pairs = [
-        ("maa5", "ding2"),
-        ("maa5", "sing4_or_sing6"),
-        ("ding2", "sing4_or_sing6"),
-    ]
-
-    for a, b in pairs:
-        for pa in positions[a]:
-            for pb in positions[b]:
-                if 1 <= pb - pa <= max_distance:
-                    return True, f"{a}+{b}"
-    return False, ""
-
-
-def audio_mentions_target(transcript):
-    text = normalize_transcript(transcript)
-    if any(x in text for x in KEYWORDS):
-        return True, "exact_name"
-    return find_cantonese_name_pair(text)
+    return False, "gemini_c_target_not_found"
 
 
 def empty_error_row(programme, url, error):
@@ -674,7 +687,7 @@ def main():
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--download-dir", default="downloads")
     parser.add_argument("--verify-sunday-audio", action="store_true")
-    parser.add_argument("--verify-seconds", type=int, default=120)
+    parser.add_argument("--verify-seconds", type=int, default=180)
     parser.add_argument("--verify-dir", default="verify_clips")
     args = parser.parse_args()
 
@@ -714,28 +727,28 @@ def main():
                         print("SUNDAY NEEDS GEMINI BUT VERIFY FLAG IS OFF: deleted")
                         continue
 
-                    print("VERIFYING SUNDAY AUDIO WITH GEMINI:", downloaded_path)
+                    print("VERIFYING SUNDAY AUDIO WITH GEMINI C MODE:", downloaded_path)
                     clip = make_verify_clip(
                         downloaded_path, args.verify_dir, args.verify_seconds
                     )
-                    transcript = transcribe_cantonese_audio_gemini(
+                    analysis_text = analyze_cantonese_audio_gemini(
                         clip, row.get("title", "")
                     )
-                    row["audio_transcript"] = transcript
+                    row["audio_transcript"] = analysis_text
 
-                    ok, groups = audio_mentions_target(transcript)
+                    ok, groups = audio_analysis_mentions_target(analysis_text)
                     row["audio_match_groups"] = groups
 
                     if ok:
                         row["audio_verified"] = "true"
-                        row["download_status"] = "downloaded_gemini_verified"
-                        print("GEMINI VERIFIED: keep file")
+                        row["download_status"] = "downloaded_gemini_c_verified"
+                        print("GEMINI C VERIFIED: keep file")
                     else:
                         row["audio_verified"] = "false"
-                        row["download_status"] = "rejected_by_gemini_audio_check"
+                        row["download_status"] = "rejected_by_gemini_c_audio_check"
                         if downloaded_file.exists():
                             downloaded_file.unlink()
-                        print("GEMINI NOT VERIFIED: deleted file")
+                        print("GEMINI C TARGET NOT FOUND: deleted file")
 
                 elif row["programme"] == "sunday":
                     row["audio_verified"] = "not_required"
