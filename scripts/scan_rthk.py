@@ -12,7 +12,7 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-print("RUNNING RTHK MP3 - EPISODE DETAIL PARSER + GEMINI AUDIO UNDERSTANDING C")
+print("RUNNING RTHK MP3 - EPISODE DETAIL PARSER + GEMINI C FALLBACK FOR SUNDAY/MONDAY")
 
 KEYWORDS = ["馬鼎盛", "马鼎盛"]
 PEOPLE_LABELS = ["主持人", "主持", "嘉賓", "嘉宾"]
@@ -357,20 +357,32 @@ def build_people_fields(items):
 
 
 def decide_match(programme_name, reliable_people, matched_text):
+    """
+    Sunday and Monday use the same trust model:
+
+    1. Reliable episode-specific people block:
+       - contains 馬鼎盛 -> download directly
+       - does not contain 馬鼎盛 -> do not download
+
+    2. Episode-specific people block cannot be trusted:
+       - download as a candidate
+       - verify the opening audio with Gemini C mode
+
+    This deliberately avoids trusting a whole-page fixed roster.
+    """
     page_match = any(x in matched_text for x in KEYWORDS)
 
-    if programme_name == "sunday":
-        if reliable_people:
-            if page_match:
-                return True, False, "direct_episode_name_match", True
-            return False, False, "episode_people_no_target", False
+    if reliable_people:
+        if page_match:
+            return True, False, "direct_episode_name_match", True
+        return False, False, "episode_people_no_target", False
 
-        # Only when the episode-specific block cannot be trusted do we use Gemini.
-        return True, True, "episode_people_unavailable_gemini_fallback", page_match
-
-    if page_match:
-        return True, False, "direct_episode_name_match", True
-    return False, False, "episode_people_no_target", False
+    return (
+        True,
+        True,
+        f"{programme_name}_episode_people_unavailable_gemini_fallback",
+        page_match,
+    )
 
 
 def extract_detail(programme_name, episode_url, expected_date="", expected_title=""):
@@ -385,12 +397,6 @@ def extract_detail(programme_name, episode_url, expected_date="", expected_title
     selected, reliable, people_source = select_episode_people_items(
         programme_name, all_items, start, end, anchor
     )
-
-    # Keep Monday compatibility with older page layouts.
-    if programme_name == "monday" and not reliable and all_items:
-        selected = all_items
-        reliable = True
-        people_source = "monday_whole_page_fallback"
 
     fields = build_people_fields(selected)
     matched, needs_verify, reason, page_match = decide_match(
@@ -441,7 +447,7 @@ def extract_detail(programme_name, episode_url, expected_date="", expected_title
 
 def safe_filename_from_date(value):
     d = parse_date(value)
-    return d.strftime("%m%d") if d else "unknown"
+    return d.strftime("%Y%m%d") if d else "unknown"
 
 
 def download_mp3(row, download_dir):
@@ -686,10 +692,14 @@ def main():
     parser.add_argument("--max-pages", type=int, default=20)
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--download-dir", default="downloads")
+    # --verify-audio is the generic flag for both Sunday and Monday.
+    # --verify-sunday-audio remains as a backward-compatible alias.
+    parser.add_argument("--verify-audio", action="store_true")
     parser.add_argument("--verify-sunday-audio", action="store_true")
     parser.add_argument("--verify-seconds", type=int, default=180)
     parser.add_argument("--verify-dir", default="verify_clips")
     args = parser.parse_args()
+    verify_audio_enabled = args.verify_audio or args.verify_sunday_audio
 
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
     end = datetime.strptime(args.end, "%Y-%m-%d").date()
@@ -719,18 +729,27 @@ def main():
                 row["filename"] = downloaded_file.name
                 row["download_status"] = "downloaded"
 
-                if row["programme"] == "sunday" and row.get("needs_audio_verify") is True:
-                    if not args.verify_sunday_audio:
+                if row.get("needs_audio_verify") is True:
+                    if not verify_audio_enabled:
                         row["download_status"] = "verification_not_enabled"
                         if downloaded_file.exists():
                             downloaded_file.unlink()
-                        print("SUNDAY NEEDS GEMINI BUT VERIFY FLAG IS OFF: deleted")
+                        print(
+                            f"{row['programme'].upper()} NEEDS GEMINI "
+                            "BUT VERIFY FLAG IS OFF: deleted"
+                        )
                         continue
 
-                    print("VERIFYING SUNDAY AUDIO WITH GEMINI C MODE:", downloaded_path)
+                    print(
+                        f"VERIFYING {row['programme'].upper()} AUDIO "
+                        "WITH GEMINI C MODE:",
+                        downloaded_path,
+                    )
+
                     clip = make_verify_clip(
                         downloaded_path, args.verify_dir, args.verify_seconds
                     )
+
                     analysis_text = analyze_cantonese_audio_gemini(
                         clip, row.get("title", "")
                     )
@@ -750,7 +769,7 @@ def main():
                             downloaded_file.unlink()
                         print("GEMINI C TARGET NOT FOUND: deleted file")
 
-                elif row["programme"] == "sunday":
+                else:
                     row["audio_verified"] = "not_required"
 
             except Exception as exc:
@@ -758,13 +777,15 @@ def main():
                 row["error"] = str(exc)
 
                 if (
-                    row.get("programme") == "sunday"
-                    and row.get("needs_audio_verify") is True
+                    row.get("needs_audio_verify") is True
                     and downloaded_file is not None
                     and downloaded_file.exists()
                 ):
                     downloaded_file.unlink()
-                    print("VERIFY ERROR: unverified Sunday file deleted")
+                    print(
+                        f"VERIFY ERROR: unverified "
+                        f"{row.get('programme', 'episode')} file deleted"
+                    )
 
                 all_errors.append(row.copy())
 
