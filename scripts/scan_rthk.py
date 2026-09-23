@@ -13,7 +13,7 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-print("RUNNING RTHK MP3 - EPISODE DETAIL PARSER + GEMINI C FALLBACK FOR SUNDAY/MONDAY")
+print("RUNNING RTHK MP3 - INDEPENDENT SUNDAY/MONDAY PARSERS + GEMINI C FALLBACK")
 
 KEYWORDS = ["馬鼎盛", "马鼎盛"]
 PEOPLE_LABELS = ["主持人", "主持", "嘉賓", "嘉宾"]
@@ -311,30 +311,107 @@ def find_episode_scope(lines, expected_date="", expected_title=""):
     return 0, -1, -1, "not_found"
 
 
-def select_episode_people_items(programme_name, items, start, end, anchor):
+def select_sunday_episode_people(items, start, end, anchor):
+    """Select Sunday episode-specific people information.
+
+    Sunday pages may use 主持人 as the actual episode field, while a broad
+    programme-level roster can also appear on the page.  Therefore Sunday
+    keeps its own scoped/generic-roster logic.
+    """
     if end < start or anchor < 0:
-        return [], False, "no_episode_anchor"
+        return [], False, "sunday_no_episode_anchor"
 
     scoped = [x for x in items if start <= x["index"] <= end]
     if not scoped:
-        return [], False, "no_people_near_episode"
+        return [], False, "sunday_no_people_near_episode"
 
-    if programme_name == "sunday":
-        non_generic = [x for x in scoped if not is_generic_sunday_people_text(x["text"])]
-        if non_generic:
-            scoped = non_generic
-        else:
-            return scoped, False, "generic_roster_near_episode"
+    non_generic = [
+        x for x in scoped
+        if not is_generic_sunday_people_text(x["text"])
+    ]
+
+    if non_generic:
+        scoped = non_generic
+    else:
+        return scoped, False, "sunday_generic_roster_near_episode"
 
     if min(abs(x["index"] - anchor) for x in scoped) > 35:
-        return [], False, "people_too_far_from_episode"
+        return [], False, "sunday_people_too_far_from_episode"
 
     nearest = min(scoped, key=lambda x: abs(x["index"] - anchor))["index"]
     block = [x for x in scoped if abs(x["index"] - nearest) <= 12]
 
     if not block:
-        return [], False, "no_local_people_block"
-    return block, True, "episode_detail"
+        return [], False, "sunday_no_local_people_block"
+
+    return block, True, "sunday_episode_detail"
+
+
+def select_monday_episode_people(items, anchor):
+    """Select Monday episode-specific people information.
+
+    Monday has a different RTHK page structure from Sunday:
+
+      主持人：...       programme-level fixed presenter roster -> IGNORE
+      主持：...         presenters for this episode             -> TRUST
+      嘉賓／嘉宾：...   guests for this episode                  -> TRUST
+
+    The explicit 主持 field can be far away from the title/date in flattened
+    page text, so Monday does not use Sunday's +/-35-line rule.
+    """
+    explicit_hosts = [x for x in items if x["label"] == "主持"]
+    explicit_guests = [x for x in items if x["label"] in {"嘉賓", "嘉宾"}]
+
+    # Strongest case: exactly one explicit 主持 field on this episode page.
+    # Trust it directly and attach nearby guest fields, if any.
+    if len(explicit_hosts) == 1:
+        host = explicit_hosts[0]
+        block = [host]
+        block.extend(
+            x for x in explicit_guests
+            if abs(x["index"] - host["index"]) <= 12
+        )
+        block.sort(key=lambda x: x["index"])
+        return block, True, "monday_explicit_host"
+
+    # If multiple explicit 主持 fields exist, choose the one closest to this
+    # episode's title/date anchor.  Still do not impose a maximum distance.
+    if len(explicit_hosts) > 1:
+        if anchor >= 0:
+            host = min(
+                explicit_hosts,
+                key=lambda x: abs(x["index"] - anchor),
+            )
+        else:
+            host = explicit_hosts[0]
+
+        block = [host]
+        block.extend(
+            x for x in explicit_guests
+            if abs(x["index"] - host["index"]) <= 12
+        )
+        block.sort(key=lambda x: x["index"])
+        return block, True, "monday_explicit_host_nearest"
+
+    # Some episodes may have an explicit guest field but no 主持 field.
+    # Treat that as episode-specific data, but it only proves a match when
+    # 馬鼎盛 actually appears in that field.
+    if explicit_guests:
+        if len(explicit_guests) == 1:
+            guest = explicit_guests[0]
+        elif anchor >= 0:
+            guest = min(
+                explicit_guests,
+                key=lambda x: abs(x["index"] - anchor),
+            )
+        else:
+            guest = explicit_guests[0]
+
+        return [guest], True, "monday_explicit_guest_only"
+
+    # Only programme-level 主持人 remains (or no people data at all).
+    # Do not trust it for a Monday episode decision; use Gemini fallback.
+    return [], False, "monday_no_explicit_episode_host_guest"
 
 
 def build_people_fields(items):
@@ -357,61 +434,56 @@ def build_people_fields(items):
     }
 
 
-def decide_match(programme_name, reliable_people, matched_text):
-    """
-    Sunday and Monday use the same trust model:
+def decide_sunday_match(reliable_people, matched_text):
+    """Sunday decision policy only."""
+    page_match = any(x in matched_text for x in KEYWORDS)
 
-    1. Reliable episode-specific people block:
-       - contains 馬鼎盛 -> download directly
-       - does not contain 馬鼎盛 -> do not download
+    if reliable_people:
+        if page_match:
+            return True, False, "sunday_direct_episode_name_match", True
+        return False, False, "sunday_episode_people_no_target", False
 
-    2. Episode-specific people block cannot be trusted:
-       - download as a candidate
-       - verify the opening audio with Gemini C mode
+    # Sunday episode-specific people data is not trustworthy/available.
+    # Download as candidate and let Gemini C inspect the opening audio.
+    return True, True, "sunday_episode_people_unavailable_gemini_fallback", page_match
 
-    This deliberately avoids trusting a whole-page fixed roster.
+
+def decide_monday_match(reliable_people, matched_text):
+    """Monday decision policy only.
+
+    Monday trusts only explicit episode-level 主持 / 嘉賓 fields.  The broad
+    主持人 roster is never used as evidence for the current episode.
     """
     page_match = any(x in matched_text for x in KEYWORDS)
 
     if reliable_people:
         if page_match:
-            return True, False, "direct_episode_name_match", True
-        return False, False, "episode_people_no_target", False
+            return True, False, "monday_direct_episode_name_match", True
+        return False, False, "monday_episode_people_no_target", False
 
-    return (
-        True,
-        True,
-        f"{programme_name}_episode_people_unavailable_gemini_fallback",
-        page_match,
-    )
+    # No explicit Monday 主持/嘉賓 field was found.  Only here do we use
+    # Gemini C as an audio fallback.
+    return True, True, "monday_episode_people_unavailable_gemini_fallback", page_match
 
 
-def extract_detail(programme_name, episode_url, expected_date="", expected_title=""):
-    raw = fetch(episode_url)
-    lines = normalize_text(raw)
-    all_items = extract_people_items(lines)
-
-    start, end, anchor, anchor_source = find_episode_scope(
-        lines, expected_date, expected_title
-    )
-
-    selected, reliable, people_source = select_episode_people_items(
-        programme_name, all_items, start, end, anchor
-    )
-
-    fields = build_people_fields(selected)
-    matched, needs_verify, reason, page_match = decide_match(
-        programme_name, reliable, fields["matched_text"]
-    )
-
-    fixed_roster = (
-        programme_name == "sunday"
-        and any(is_generic_sunday_people_text(x["text"]) for x in all_items)
-    )
-
+def build_episode_row(
+    programme_name,
+    expected_date,
+    expected_title,
+    episode_url,
+    fields,
+    matched,
+    needs_verify,
+    reason,
+    page_match,
+    reliable,
+    people_source,
+    anchor_source,
+    fixed_roster,
+):
     d = parse_date(expected_date)
 
-    row = {
+    return {
         "date": d.isoformat() if d else "",
         "programme": programme_name,
         "title": expected_title.strip(),
@@ -436,8 +508,49 @@ def extract_detail(programme_name, episode_url, expected_date="", expected_title
         "error": "",
     }
 
+
+def extract_sunday_detail(episode_url, expected_date="", expected_title=""):
+    """Sunday parser and decision path. Independent from Monday."""
+    raw = fetch(episode_url)
+    lines = normalize_text(raw)
+    all_items = extract_people_items(lines)
+
+    start, end, anchor, anchor_source = find_episode_scope(
+        lines, expected_date, expected_title
+    )
+
+    selected, reliable, people_source = select_sunday_episode_people(
+        all_items, start, end, anchor
+    )
+
+    fields = build_people_fields(selected)
+    matched, needs_verify, reason, page_match = decide_sunday_match(
+        reliable, fields["matched_text"]
+    )
+
+    fixed_roster = any(
+        is_generic_sunday_people_text(x["text"])
+        for x in all_items
+    )
+
+    row = build_episode_row(
+        "sunday",
+        expected_date,
+        expected_title,
+        episode_url,
+        fields,
+        matched,
+        needs_verify,
+        reason,
+        page_match,
+        reliable,
+        people_source,
+        anchor_source,
+        fixed_roster,
+    )
+
     print(
-        f"EPISODE DECISION: {programme_name} date={row['date'] or '?'} "
+        f"EPISODE DECISION: sunday date={row['date'] or '?'} "
         f"anchor={anchor_source} source={people_source} "
         f"people={row['people_names'] or '(none)'} "
         f"page_match={page_match} candidate={matched} "
@@ -445,6 +558,74 @@ def extract_detail(programme_name, episode_url, expected_date="", expected_title
     )
     return row
 
+
+def extract_monday_detail(episode_url, expected_date="", expected_title=""):
+    """Monday parser and decision path. Independent from Sunday."""
+    raw = fetch(episode_url)
+    lines = normalize_text(raw)
+    all_items = extract_people_items(lines)
+
+    # We still calculate the episode anchor only to disambiguate multiple
+    # explicit 主持 fields.  Monday does NOT use Sunday's scoped-distance rule.
+    _start, _end, anchor, anchor_source = find_episode_scope(
+        lines, expected_date, expected_title
+    )
+
+    selected, reliable, people_source = select_monday_episode_people(
+        all_items, anchor
+    )
+
+    fields = build_people_fields(selected)
+    matched, needs_verify, reason, page_match = decide_monday_match(
+        reliable, fields["matched_text"]
+    )
+
+    # For diagnostics only: Monday fixed roster means a 主持人 field exists.
+    # It is never used for the current-episode match decision.
+    fixed_roster = any(x["label"] == "主持人" for x in all_items)
+
+    row = build_episode_row(
+        "monday",
+        expected_date,
+        expected_title,
+        episode_url,
+        fields,
+        matched,
+        needs_verify,
+        reason,
+        page_match,
+        reliable,
+        people_source,
+        anchor_source,
+        fixed_roster,
+    )
+
+    print(
+        f"EPISODE DECISION: monday date={row['date'] or '?'} "
+        f"anchor={anchor_source} source={people_source} "
+        f"people={row['people_names'] or '(none)'} "
+        f"page_match={page_match} candidate={matched} "
+        f"verify={needs_verify} reason={reason}"
+    )
+    return row
+
+
+def extract_detail(programme_name, episode_url, expected_date="", expected_title=""):
+    if programme_name == "sunday":
+        return extract_sunday_detail(
+            episode_url,
+            expected_date=expected_date,
+            expected_title=expected_title,
+        )
+
+    if programme_name == "monday":
+        return extract_monday_detail(
+            episode_url,
+            expected_date=expected_date,
+            expected_title=expected_title,
+        )
+
+    raise ValueError(f"Unsupported programme: {programme_name}")
 
 def safe_filename_from_date(value):
     d = parse_date(value)
