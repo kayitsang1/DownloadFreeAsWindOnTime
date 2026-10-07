@@ -47,6 +47,8 @@ jobs:
       - name: Download Monday MP3 and verify fallback
         env:
           TZ: Asia/Hong_Kong
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           TARGET_DATE=$(date -d "yesterday" +%F)
