@@ -13,7 +13,7 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-print("RUNNING RTHK MP3 - INDEPENDENT SUNDAY/MONDAY PARSERS + GEMINI C FALLBACK")
+print("RUNNING RTHK MP3 - WEB PAGE FIRST + CLOUDFLARE WHISPER PRIMARY + GEMINI FALLBACK")
 
 KEYWORDS = ["馬鼎盛", "马鼎盛"]
 PEOPLE_LABELS = ["主持人", "主持", "嘉賓", "嘉宾"]
@@ -23,6 +23,7 @@ SUNDAY_GENERIC_HOSTS = [
     "蘇頴", "邱逸", "鄧達智", "黃仲遠",
 ]
 
+CLOUDFLARE_WHISPER_MODEL = "@cf/openai/whisper-large-v3-turbo"
 GEMINI_AUDIO_MODEL = "gemini-3.8-flash"
 
 GEMINI_NAMES_PROMPT = """
@@ -677,6 +678,154 @@ def make_verify_clip(mp3_path, verify_dir, seconds):
     return str(clip)
 
 
+
+def analyze_cantonese_audio_cloudflare(audio_path, episode_title=""):
+    """
+    Primary audio verification layer.
+
+    Uses Cloudflare Workers AI Whisper Large v3 Turbo to transcribe the
+    verification clip in Cantonese.  This layer only performs ASR.  An exact
+    transcription hit for 馬鼎盛 / 马鼎盛 is sufficient to keep the episode.
+    A miss or a technical error is NOT sufficient to delete the episode; in
+    either case the caller falls back to Gemini Audio Understanding.
+    """
+    account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    api_token = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+
+    if not account_id:
+        raise RuntimeError("CLOUDFLARE_ACCOUNT_ID is not configured")
+    if not api_token:
+        raise RuntimeError("CLOUDFLARE_API_TOKEN is not configured")
+
+    audio_file = Path(audio_path)
+    if not audio_file.exists():
+        raise RuntimeError(f"Verify clip not found: {audio_path}")
+
+    audio_bytes = audio_file.read_bytes()
+    size_mb = len(audio_bytes) / (1024 * 1024)
+
+    print(f"CLOUDFLARE VERIFY CLIP SIZE: {size_mb:.2f} MB")
+
+    url = (
+        "https://api.cloudflare.com/client/v4/accounts/"
+        f"{account_id}/ai/run/{CLOUDFLARE_WHISPER_MODEL}"
+    )
+
+    initial_prompt = (
+        "香港粵語電台節目《講東講西》。"
+        "請準確轉錄節目開場的主持人、嘉賓介紹及自我介紹，"
+        "尤其保留人名原字，使用繁體中文。"
+    )
+    if episode_title:
+        initial_prompt += f" 本集題目：{episode_title.strip()}。"
+
+    request_json = {
+        "audio": base64.b64encode(audio_bytes).decode("utf-8"),
+        "task": "transcribe",
+        "language": "yue",
+        "vad_filter": True,
+        "beam_size": 5,
+        "condition_on_previous_text": False,
+        "initial_prompt": initial_prompt,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json",
+    }
+
+    last_exc = None
+
+    for attempt in range(1, 3):
+        try:
+            print(f"CLOUDFLARE WHISPER ATTEMPT {attempt}/2")
+
+            response = requests.post(
+                url,
+                headers=headers,
+                json=request_json,
+                timeout=120,
+            )
+
+            if response.status_code >= 400:
+                body = response.text[:1500]
+                raise RuntimeError(
+                    f"Cloudflare HTTP {response.status_code}: {body}"
+                )
+
+            data = response.json()
+
+            if data.get("success") is False:
+                raise RuntimeError(
+                    "Cloudflare API reported failure: "
+                    f"{data.get('errors') or data}"
+                )
+
+            result = data.get("result") or {}
+            transcript = ""
+
+            if isinstance(result, dict):
+                transcript = str(result.get("text") or "").strip()
+                if not transcript:
+                    info = result.get("transcription_info") or {}
+                    if isinstance(info, dict):
+                        transcript = str(info.get("text") or "").strip()
+            elif isinstance(result, str):
+                transcript = result.strip()
+
+            if not transcript:
+                raise RuntimeError(
+                    "Cloudflare Whisper returned no transcription text"
+                )
+
+            print("")
+            print("=" * 70)
+            print("CLOUDFLARE WHISPER - CANTONESE TRANSCRIPT")
+            print("=" * 70)
+            print(transcript)
+            print("=" * 70)
+            print("")
+
+            return transcript
+
+        except Exception as exc:
+            last_exc = exc
+            print(
+                "CLOUDFLARE WHISPER ERROR:",
+                f"{type(exc).__name__}: {exc}",
+            )
+
+            if attempt < 2:
+                print("CLOUDFLARE WHISPER RETRYING IN 10 SECONDS...")
+                time.sleep(10)
+
+    raise RuntimeError(
+        "Cloudflare Whisper failed after 2 attempts: "
+        f"{type(last_exc).__name__}: {last_exc}"
+    )
+
+
+def normalize_asr_result(text):
+    return re.sub(
+        r"[\s，,。.!！?？、：:；;「」『』（）()\[\]【】]",
+        "",
+        str(text or ""),
+    )
+
+
+def cloudflare_transcript_mentions_target(transcript):
+    """
+    Keep this intentionally conservative: only an exact target-name hit lets
+    Cloudflare make the final KEEP decision.  A miss always goes to Gemini.
+    """
+    normalized = normalize_asr_result(transcript)
+
+    for keyword in KEYWORDS:
+        if keyword in normalized:
+            return True, "cloudflare_whisper_exact_name"
+
+    return False, "cloudflare_whisper_target_not_found"
+
 def analyze_cantonese_audio_gemini(audio_path, episode_title=""):
     """
     Gemini Audio Understanding - C mode.
@@ -980,14 +1129,14 @@ def main():
                         if downloaded_file.exists():
                             downloaded_file.unlink()
                         print(
-                            f"{row['programme'].upper()} NEEDS GEMINI "
+                            f"{row['programme'].upper()} NEEDS AUDIO VERIFICATION "
                             "BUT VERIFY FLAG IS OFF: deleted"
                         )
                         continue
 
                     print(
                         f"VERIFYING {row['programme'].upper()} AUDIO "
-                        "WITH GEMINI C MODE:",
+                        "WITH CLOUDFLARE WHISPER PRIMARY / GEMINI FALLBACK:",
                         downloaded_path,
                     )
 
@@ -995,24 +1144,96 @@ def main():
                         downloaded_path, args.verify_dir, args.verify_seconds
                     )
 
+                    cloudflare_text = ""
+                    cloudflare_error = ""
+                    cloudflare_ok = False
+                    cloudflare_group = ""
+
+                    try:
+                        cloudflare_text = analyze_cantonese_audio_cloudflare(
+                            clip, row.get("title", "")
+                        )
+                        cloudflare_ok, cloudflare_group = (
+                            cloudflare_transcript_mentions_target(
+                                cloudflare_text
+                            )
+                        )
+                    except Exception as cf_exc:
+                        cloudflare_error = (
+                            f"{type(cf_exc).__name__}: {cf_exc}"
+                        )
+                        print(
+                            "CLOUDFLARE PRIMARY FAILED; "
+                            "FALLING BACK TO GEMINI:",
+                            cloudflare_error,
+                        )
+
+                    if cloudflare_ok:
+                        row["audio_transcript"] = (
+                            "[Cloudflare Whisper]\n" + cloudflare_text
+                        )
+                        row["audio_match_groups"] = cloudflare_group
+                        row["audio_verified"] = "true"
+                        row["download_status"] = (
+                            "downloaded_cloudflare_whisper_verified"
+                        )
+                        print(
+                            "CLOUDFLARE WHISPER VERIFIED EXACT TARGET: "
+                            "keep file; Gemini not required"
+                        )
+                        continue
+
+                    if cloudflare_text:
+                        print(
+                            "CLOUDFLARE WHISPER DID NOT TRANSCRIBE THE "
+                            "EXACT TARGET NAME; FALLING BACK TO GEMINI"
+                        )
+
                     analysis_text = analyze_cantonese_audio_gemini(
                         clip, row.get("title", "")
                     )
-                    row["audio_transcript"] = analysis_text
+
+                    transcript_parts = []
+                    if cloudflare_text:
+                        transcript_parts.append(
+                            "[Cloudflare Whisper]\n" + cloudflare_text
+                        )
+                    if cloudflare_error:
+                        transcript_parts.append(
+                            "[Cloudflare error]\n" + cloudflare_error
+                        )
+                    transcript_parts.append(
+                        "[Gemini Audio Understanding]\n" + analysis_text
+                    )
+                    row["audio_transcript"] = "\n\n".join(
+                        transcript_parts
+                    )
 
                     ok, groups = audio_analysis_mentions_target(analysis_text)
+                    if cloudflare_group:
+                        groups = cloudflare_group + "+" + groups
+                    elif cloudflare_error:
+                        groups = "cloudflare_error+" + groups
                     row["audio_match_groups"] = groups
 
                     if ok:
                         row["audio_verified"] = "true"
-                        row["download_status"] = "downloaded_gemini_c_verified"
-                        print("GEMINI C VERIFIED: keep file")
+                        row["download_status"] = (
+                            "downloaded_gemini_fallback_verified"
+                        )
+                        print("GEMINI FALLBACK VERIFIED: keep file")
                     else:
                         row["audio_verified"] = "false"
-                        row["download_status"] = "rejected_by_gemini_c_audio_check"
+                        row["download_status"] = (
+                            "rejected_by_gemini_fallback_audio_check"
+                        )
                         if downloaded_file.exists():
                             downloaded_file.unlink()
-                        print("GEMINI C TARGET NOT FOUND: deleted file")
+                        print(
+                            "CLOUDFLARE DID NOT CONFIRM TARGET AND "
+                            "GEMINI FALLBACK ALSO DID NOT FIND TARGET: "
+                            "deleted file"
+                        )
 
                 else:
                     row["audio_verified"] = "not_required"
@@ -1030,13 +1251,13 @@ def main():
                     and downloaded_file is not None
                     and downloaded_file.exists()
                 ):
-                    # A technical Gemini/API failure is not evidence that
+                    # A technical AI/API failure is not evidence that
                     # 馬鼎盛 is absent. Keep the candidate so it can still be
                     # uploaded to Drive and reviewed/re-analysed later.
                     row["audio_verified"] = "uncertain"
-                    row["download_status"] = "gemini_error_kept_for_review"
+                    row["download_status"] = "audio_ai_error_kept_for_review"
                     print(
-                        "GEMINI TECHNICAL ERROR: candidate MP3 kept "
+                        "AUDIO AI TECHNICAL ERROR: candidate MP3 kept "
                         "for later review"
                     )
                 else:
